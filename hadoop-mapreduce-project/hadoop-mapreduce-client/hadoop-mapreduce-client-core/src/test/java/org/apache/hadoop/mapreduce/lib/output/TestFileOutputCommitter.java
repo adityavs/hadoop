@@ -20,14 +20,19 @@ package org.apache.hadoop.mapreduce.lib.output;
 
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.net.URI;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
-import junit.framework.TestCase;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Test;
+import static org.junit.Assert.*;
+import org.apache.hadoop.util.concurrent.HadoopExecutors;
+import org.junit.Assert;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -53,7 +58,7 @@ import org.apache.hadoop.mapreduce.task.JobContextImpl;
 import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl;
 
 @SuppressWarnings("unchecked")
-public class TestFileOutputCommitter extends TestCase {
+public class TestFileOutputCommitter {
   private static final Path outDir = new Path(
       System.getProperty("test.build.data",
           System.getProperty("java.io.tmpdir")),
@@ -85,12 +90,12 @@ public class TestFileOutputCommitter extends TestCase {
     fs.delete(outDir, true);
   }
   
-  @Override
+  @Before
   public void setUp() throws IOException {
     cleanup();
   }
-  
-  @Override
+
+  @After
   public void tearDown() throws IOException {
     cleanup();
   }
@@ -193,14 +198,17 @@ public class TestFileOutputCommitter extends TestCase {
     FileUtil.fullyDelete(new File(outDir.toString()));
   }
 
+  @Test
   public void testRecoveryV1() throws Exception {
     testRecoveryInternal(1, 1);
   }
 
+  @Test
   public void testRecoveryV2() throws Exception {
     testRecoveryInternal(2, 2);
   }
 
+  @Test
   public void testRecoveryUpgradeV1V2() throws Exception {
     testRecoveryInternal(1, 2);
   }
@@ -276,12 +284,188 @@ public class TestFileOutputCommitter extends TestCase {
     FileUtil.fullyDelete(new File(outDir.toString()));
   }
 
+  @Test
   public void testCommitterV1() throws Exception {
     testCommitterInternal(1);
   }
 
+  @Test
   public void testCommitterV2() throws Exception {
     testCommitterInternal(2);
+  }
+
+  @Test
+  public void testCommitterWithDuplicatedCommitV1() throws Exception {
+    testCommitterWithDuplicatedCommitInternal(1);
+  }
+
+  @Test
+  public void testCommitterWithDuplicatedCommitV2() throws Exception {
+    testCommitterWithDuplicatedCommitInternal(2);
+  }
+
+  private void testCommitterWithDuplicatedCommitInternal(int version) throws
+      Exception {
+    Job job = Job.getInstance();
+    FileOutputFormat.setOutputPath(job, outDir);
+    Configuration conf = job.getConfiguration();
+    conf.set(MRJobConfig.TASK_ATTEMPT_ID, attempt);
+    conf.setInt(FileOutputCommitter.FILEOUTPUTCOMMITTER_ALGORITHM_VERSION,
+        version);
+    JobContext jContext = new JobContextImpl(conf, taskID.getJobID());
+    TaskAttemptContext tContext = new TaskAttemptContextImpl(conf, taskID);
+    FileOutputCommitter committer = new FileOutputCommitter(outDir, tContext);
+
+    // setup
+    committer.setupJob(jContext);
+    committer.setupTask(tContext);
+
+    // write output
+    TextOutputFormat theOutputFormat = new TextOutputFormat();
+    RecordWriter theRecordWriter = theOutputFormat.getRecordWriter(tContext);
+    writeOutput(theRecordWriter, tContext);
+
+    // do commit
+    committer.commitTask(tContext);
+    committer.commitJob(jContext);
+
+    // validate output
+    validateContent(outDir);
+
+    // commit job again on a successful commit job.
+    try {
+      committer.commitJob(jContext);
+      if (version == 1) {
+        Assert.fail("Duplicate commit success: wrong behavior for version 1.");
+      }
+    } catch (IOException e) {
+      if (version == 2) {
+        Assert.fail("Duplicate commit failed: wrong behavior for version 2.");
+      }
+    }
+    FileUtil.fullyDelete(new File(outDir.toString()));
+  }
+
+  @Test
+  public void testCommitterWithFailureV1() throws Exception {
+    testCommitterWithFailureInternal(1, 1);
+    testCommitterWithFailureInternal(1, 2);
+  }
+
+  @Test
+  public void testCommitterWithFailureV2() throws Exception {
+    testCommitterWithFailureInternal(2, 1);
+    testCommitterWithFailureInternal(2, 2);
+  }
+
+  private void testCommitterWithFailureInternal(int version, int maxAttempts)
+      throws Exception {
+    Job job = Job.getInstance();
+    FileOutputFormat.setOutputPath(job, outDir);
+    Configuration conf = job.getConfiguration();
+    conf.set(MRJobConfig.TASK_ATTEMPT_ID, attempt);
+    conf.setInt(FileOutputCommitter.FILEOUTPUTCOMMITTER_ALGORITHM_VERSION,
+        version);
+    conf.setInt(FileOutputCommitter.FILEOUTPUTCOMMITTER_FAILURE_ATTEMPTS,
+        maxAttempts);
+
+    JobContext jContext = new JobContextImpl(conf, taskID.getJobID());
+    TaskAttemptContext tContext = new TaskAttemptContextImpl(conf, taskID);
+    FileOutputCommitter committer = new CommitterWithFailedThenSucceed(outDir,
+        tContext);
+
+    // setup
+    committer.setupJob(jContext);
+    committer.setupTask(tContext);
+
+    // write output
+    TextOutputFormat theOutputFormat = new TextOutputFormat();
+    RecordWriter theRecordWriter = theOutputFormat.getRecordWriter(tContext);
+    writeOutput(theRecordWriter, tContext);
+
+    // do commit
+    committer.commitTask(tContext);
+
+    try {
+      committer.commitJob(jContext);
+      // (1,1), (1,2), (2,1) shouldn't reach to here.
+      if (version == 1 || maxAttempts <= 1) {
+        Assert.fail("Commit successful: wrong behavior for version 1.");
+      }
+    } catch (IOException e) {
+      // (2,2) shouldn't reach to here.
+      if (version == 2 && maxAttempts > 2) {
+        Assert.fail("Commit failed: wrong behavior for version 2.");
+      }
+    }
+
+    FileUtil.fullyDelete(new File(outDir.toString()));
+  }
+
+  @Test
+  public void testCommitterRepeatableV1() throws Exception {
+    testCommitterRetryInternal(1);
+  }
+
+  @Test
+  public void testCommitterRepeatableV2() throws Exception {
+    testCommitterRetryInternal(2);
+  }
+
+  // retry committer for 2 times.
+  private void testCommitterRetryInternal(int version)
+      throws Exception {
+    Job job = Job.getInstance();
+    FileOutputFormat.setOutputPath(job, outDir);
+    Configuration conf = job.getConfiguration();
+    conf.set(MRJobConfig.TASK_ATTEMPT_ID, attempt);
+    conf.setInt(FileOutputCommitter.FILEOUTPUTCOMMITTER_ALGORITHM_VERSION,
+        version);
+    // only attempt for 1 time.
+    conf.setInt(FileOutputCommitter.FILEOUTPUTCOMMITTER_FAILURE_ATTEMPTS,
+        1);
+
+    JobContext jContext = new JobContextImpl(conf, taskID.getJobID());
+    TaskAttemptContext tContext = new TaskAttemptContextImpl(conf, taskID);
+    FileOutputCommitter committer = new CommitterWithFailedThenSucceed(outDir,
+        tContext);
+
+    // setup
+    committer.setupJob(jContext);
+    committer.setupTask(tContext);
+
+    // write output
+    TextOutputFormat theOutputFormat = new TextOutputFormat();
+    RecordWriter theRecordWriter = theOutputFormat.getRecordWriter(tContext);
+    writeOutput(theRecordWriter, tContext);
+
+    // do commit
+    committer.commitTask(tContext);
+
+    try {
+      committer.commitJob(jContext);
+      Assert.fail("Commit successful: wrong behavior for the first time " +
+          "commit.");
+    } catch (IOException e) {
+      // commit again.
+      try {
+        committer.commitJob(jContext);
+        // version 1 shouldn't reach to here.
+        if (version == 1) {
+          Assert.fail("Commit successful after retry: wrong behavior for " +
+              "version 1.");
+        }
+      } catch (FileNotFoundException ex) {
+        if (version == 2) {
+          Assert.fail("Commit failed after retry: wrong behavior for" +
+              " version 2.");
+        }
+        assertTrue(ex.getMessage().contains(committer.getJobAttemptPath(
+            jContext).toString() + " does not exist"));
+      }
+    }
+
+    FileUtil.fullyDelete(new File(outDir.toString()));
   }
 
   private void testMapFileOutputCommitterInternal(int version)
@@ -292,7 +476,7 @@ public class TestFileOutputCommitter extends TestCase {
     conf.set(MRJobConfig.TASK_ATTEMPT_ID, attempt);
     conf.setInt(FileOutputCommitter.FILEOUTPUTCOMMITTER_ALGORITHM_VERSION,
         version);
-    JobContext jContext = new JobContextImpl(conf, taskID.getJobID());    
+    JobContext jContext = new JobContextImpl(conf, taskID.getJobID());
     TaskAttemptContext tContext = new TaskAttemptContextImpl(conf, taskID);
     FileOutputCommitter committer = new FileOutputCommitter(outDir, tContext);
 
@@ -323,14 +507,17 @@ public class TestFileOutputCommitter extends TestCase {
     FileUtil.fullyDelete(new File(outDir.toString()));
   }
 
+  @Test
   public void testMapFileOutputCommitterV1() throws Exception {
     testMapFileOutputCommitterInternal(1);
   }
-  
+
+  @Test
   public void testMapFileOutputCommitterV2() throws Exception {
     testMapFileOutputCommitterInternal(2);
   }
 
+  @Test
   public void testInvalidVersionNumber() throws IOException {
     Job job = Job.getInstance();
     FileOutputFormat.setOutputPath(job, outDir);
@@ -382,10 +569,12 @@ public class TestFileOutputCommitter extends TestCase {
     FileUtil.fullyDelete(new File(outDir.toString()));
   }
 
+  @Test
   public void testAbortV1() throws IOException, InterruptedException {
     testAbortInternal(1);
   }
 
+  @Test
   public void testAbortV2() throws IOException, InterruptedException {
     testAbortInternal(2);
   }
@@ -405,7 +594,7 @@ public class TestFileOutputCommitter extends TestCase {
     }
   }
 
-  
+
   private void testFailAbortInternal(int version)
       throws IOException, InterruptedException {
     Job job = Job.getInstance();
@@ -461,10 +650,12 @@ public class TestFileOutputCommitter extends TestCase {
     FileUtil.fullyDelete(new File(outDir.toString()));
   }
 
+  @Test
   public void testFailAbortV1() throws Exception {
     testFailAbortInternal(1);
   }
 
+  @Test
   public void testFailAbortV2() throws Exception {
     testFailAbortInternal(2);
   }
@@ -526,7 +717,7 @@ public class TestFileOutputCommitter extends TestCase {
       };
     }
 
-    final ExecutorService executor = Executors.newFixedThreadPool(2);
+    final ExecutorService executor = HadoopExecutors.newFixedThreadPool(2);
     try {
       for (int i = 0; i < taCtx.length; i++) {
         final int taskIdx = i;
@@ -562,10 +753,12 @@ public class TestFileOutputCommitter extends TestCase {
     FileUtil.fullyDelete(new File(outDir.toString()));
   }
 
+  @Test
   public void testConcurrentCommitTaskWithSubDirV1() throws Exception {
     testConcurrentCommitTaskWithSubDir(1);
   }
 
+  @Test
   public void testConcurrentCommitTaskWithSubDirV2() throws Exception {
     testConcurrentCommitTaskWithSubDir(2);
   }
@@ -582,6 +775,31 @@ public class TestFileOutputCommitter extends TestCase {
       in.close();
     }
     return contents;
+  }
+
+  /**
+   * The class provides a overrided implementation of commitJobInternal which
+   * causes the commit failed for the first time then succeed.
+   */
+  public static class CommitterWithFailedThenSucceed extends
+      FileOutputCommitter {
+    boolean firstTimeFail = true;
+
+    public CommitterWithFailedThenSucceed(Path outputPath,
+        JobContext context) throws IOException {
+      super(outputPath, context);
+    }
+
+    @Override
+    protected void commitJobInternal(JobContext context) throws IOException {
+      super.commitJobInternal(context);
+      if (firstTimeFail) {
+        firstTimeFail = false;
+        throw new IOException();
+      } else {
+        // succeed then, nothing to do
+      }
+    }
   }
 
 }

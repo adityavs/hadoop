@@ -18,9 +18,20 @@
 
 package org.apache.hadoop.fs;
 
-import java.io.*;
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.URI;
+import java.net.UnknownHostException;
+import java.nio.file.AccessDeniedException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Enumeration;
 import java.util.List;
 import java.util.Map;
@@ -41,11 +52,11 @@ import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.io.nativeio.NativeIO;
-import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Shell;
 import org.apache.hadoop.util.Shell.ShellCommandExecutor;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.util.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * A collection of file-processing util methods
@@ -54,7 +65,7 @@ import org.apache.commons.logging.LogFactory;
 @InterfaceStability.Evolving
 public class FileUtil {
 
-  private static final Log LOG = LogFactory.getLog(FileUtil.class);
+  private static final Logger LOG = LoggerFactory.getLogger(FileUtil.class);
 
   /* The error code is defined in winutils to indicate insufficient
    * privilege to create symbolic links. This value need to keep in
@@ -94,6 +105,22 @@ public class FileUtil {
       return new Path[]{path};
     else
       return stat2Paths(stats);
+  }
+
+  /**
+   * Register all files recursively to be deleted on exit.
+   * @param file File/directory to be deleted
+   */
+  public static void fullyDeleteOnExit(final File file) {
+    file.deleteOnExit();
+    if (file.isDirectory()) {
+      File[] files = file.listFiles();
+      if (files != null) {
+        for (File child : files) {
+          fullyDeleteOnExit(child);
+        }
+      }
+    }
   }
 
   /**
@@ -268,8 +295,8 @@ public class FileUtil {
                                         Path dst)
                                         throws IOException {
     if (srcFS == dstFS) {
-      String srcq = src.makeQualified(srcFS).toString() + Path.SEPARATOR;
-      String dstq = dst.makeQualified(dstFS).toString() + Path.SEPARATOR;
+      String srcq = srcFS.makeQualified(src).toString() + Path.SEPARATOR;
+      String dstq = dstFS.makeQualified(dst).toString() + Path.SEPARATOR;
       if (dstq.startsWith(srcq)) {
         if (srcq.length() == dstq.length()) {
           throw new IOException("Cannot copy " + src + " to itself.");
@@ -302,14 +329,15 @@ public class FileUtil {
       return copy(srcFS, srcs[0], dstFS, dst, deleteSource, overwrite, conf);
 
     // Check if dest is directory
-    if (!dstFS.exists(dst)) {
-      throw new IOException("`" + dst +"': specified destination directory " +
-                            "does not exist");
-    } else {
+    try {
       FileStatus sdst = dstFS.getFileStatus(dst);
       if (!sdst.isDirectory())
         throw new IOException("copying multiple files, but last argument `" +
                               dst + "' is not a directory");
+    } catch (FileNotFoundException e) {
+      throw new IOException(
+          "`" + dst + "': specified destination directory " +
+              "does not exist", e);
     }
 
     for (Path src : srcs) {
@@ -376,46 +404,6 @@ public class FileUtil {
       return true;
     }
 
-  }
-
-  /** Copy all files in a directory to one output file (merge). */
-  public static boolean copyMerge(FileSystem srcFS, Path srcDir,
-                                  FileSystem dstFS, Path dstFile,
-                                  boolean deleteSource,
-                                  Configuration conf, String addString) throws IOException {
-    dstFile = checkDest(srcDir.getName(), dstFS, dstFile, false);
-
-    if (!srcFS.getFileStatus(srcDir).isDirectory())
-      return false;
-
-    OutputStream out = dstFS.create(dstFile);
-
-    try {
-      FileStatus contents[] = srcFS.listStatus(srcDir);
-      Arrays.sort(contents);
-      for (int i = 0; i < contents.length; i++) {
-        if (contents[i].isFile()) {
-          InputStream in = srcFS.open(contents[i].getPath());
-          try {
-            IOUtils.copyBytes(in, out, conf, false);
-            if (addString!=null)
-              out.write(addString.getBytes("UTF-8"));
-
-          } finally {
-            in.close();
-          }
-        }
-      }
-    } finally {
-      out.close();
-    }
-
-
-    if (deleteSource) {
-      return srcFS.delete(srcDir, true);
-    } else {
-      return true;
-    }
   }
 
   /** Copy local files to a FileSystem. */
@@ -497,15 +485,21 @@ public class FileUtil {
 
   private static Path checkDest(String srcName, FileSystem dstFS, Path dst,
       boolean overwrite) throws IOException {
-    if (dstFS.exists(dst)) {
-      FileStatus sdst = dstFS.getFileStatus(dst);
+    FileStatus sdst;
+    try {
+      sdst = dstFS.getFileStatus(dst);
+    } catch (FileNotFoundException e) {
+      sdst = null;
+    }
+    if (null != sdst) {
       if (sdst.isDirectory()) {
         if (null == srcName) {
-          throw new IOException("Target " + dst + " is a directory");
+          throw new PathIsDirectoryException(dst.toString());
         }
         return checkDest(null, dstFS, new Path(dst, srcName), overwrite);
       } else if (!overwrite) {
-        throw new IOException("Target " + dst + " already exists");
+        throw new PathExistsException(dst.toString(),
+            "Target " + dst + " already exists");
       }
     }
     return dst;
@@ -703,7 +697,7 @@ public class FileUtil {
         entry = tis.getNextTarEntry();
       }
     } finally {
-      IOUtils.cleanup(LOG, tis, inputStream);
+      IOUtils.cleanupWithLogger(LOG, tis, inputStream);
     }
   }
 
@@ -739,15 +733,15 @@ public class FileUtil {
 
     int count;
     byte data[] = new byte[2048];
-    BufferedOutputStream outputStream = new BufferedOutputStream(
-        new FileOutputStream(outputFile));
+    try (BufferedOutputStream outputStream = new BufferedOutputStream(
+        new FileOutputStream(outputFile));) {
 
-    while ((count = tis.read(data)) != -1) {
-      outputStream.write(data, 0, count);
+      while ((count = tis.read(data)) != -1) {
+        outputStream.write(data, 0, count);
+      }
+
+      outputStream.flush();
     }
-
-    outputStream.flush();
-    outputStream.close();
   }
 
   /**
@@ -780,35 +774,6 @@ public class FileUtil {
         Path.getPathWithoutSchemeAndAuthority(new Path(target)).toString());
     File linkFile = new File(
         Path.getPathWithoutSchemeAndAuthority(new Path(linkname)).toString());
-
-    // If not on Java7+, copy a file instead of creating a symlink since
-    // Java6 has close to no support for symlinks on Windows. Specifically
-    // File#length and File#renameTo do not work as expected.
-    // (see HADOOP-9061 for additional details)
-    // We still create symlinks for directories, since the scenario in this
-    // case is different. The directory content could change in which
-    // case the symlink loses its purpose (for example task attempt log folder
-    // is symlinked under userlogs and userlogs are generated afterwards).
-    if (Shell.WINDOWS && !Shell.isJava7OrAbove() && targetFile.isFile()) {
-      try {
-        LOG.warn("FileUtil#symlink: On Windows+Java6, copying file instead " +
-            "of creating a symlink. Copying " + target + " -> " + linkname);
-
-        if (!linkFile.getParentFile().exists()) {
-          LOG.warn("Parent directory " + linkFile.getParent() +
-              " does not exist.");
-          return 1;
-        } else {
-          org.apache.commons.io.FileUtils.copyFile(targetFile, linkFile);
-        }
-      } catch (IOException ex) {
-        LOG.warn("FileUtil#symlink failed to copy the file with error: "
-            + ex.getMessage());
-        // Exit with non-zero exit code
-        return 1;
-      }
-      return 0;
-    }
 
     String[] cmd = Shell.getSymlinkCommand(
         targetFile.toString(),
@@ -1185,9 +1150,14 @@ public class FileUtil {
    * an IOException to be thrown.
    * @param dir directory for which listing should be performed
    * @return list of file names or empty string list
-   * @exception IOException for invalid directory or for a bad disk.
+   * @exception AccessDeniedException for unreadable directory
+   * @exception IOException for invalid directory or for bad disk
    */
   public static String[] list(File dir) throws IOException {
+    if (!canRead(dir)) {
+      throw new AccessDeniedException(dir.toString(), null,
+          FSExceptionMessages.PERMISSION_DENIED);
+    }
     String[] fileNames = dir.list();
     if(fileNames == null) {
       throw new IOException("Invalid directory or I/O error occurred for dir: "
@@ -1262,19 +1232,13 @@ public class FileUtil {
         continue;
       }
       if (classPathEntry.endsWith("*")) {
-        boolean foundWildCardJar = false;
         // Append all jars that match the wildcard
-        Path globPath = new Path(classPathEntry).suffix("{.jar,.JAR}");
-        FileStatus[] wildcardJars = FileContext.getLocalFSFileContext().util()
-          .globStatus(globPath);
-        if (wildcardJars != null) {
-          for (FileStatus wildcardJar: wildcardJars) {
-            foundWildCardJar = true;
-            classPathEntryList.add(wildcardJar.getPath().toUri().toURL()
-              .toExternalForm());
+        List<Path> jars = getJarsInDirectory(classPathEntry);
+        if (!jars.isEmpty()) {
+          for (Path jar: jars) {
+            classPathEntryList.add(jar.toUri().toURL().toExternalForm());
           }
-        }
-        if (!foundWildCardJar) {
+        } else {
           unexpandedWildcardClasspath.append(File.pathSeparator);
           unexpandedWildcardClasspath.append(classPathEntry);
         }
@@ -1323,10 +1287,91 @@ public class FileUtil {
       bos = new BufferedOutputStream(fos);
       jos = new JarOutputStream(bos, jarManifest);
     } finally {
-      IOUtils.cleanup(LOG, jos, bos, fos);
+      IOUtils.cleanupWithLogger(LOG, jos, bos, fos);
     }
     String[] jarCp = {classPathJar.getCanonicalPath(),
                         unexpandedWildcardClasspath.toString()};
     return jarCp;
+  }
+
+  /**
+   * Returns all jars that are in the directory. It is useful in expanding a
+   * wildcard path to return all jars from the directory to use in a classpath.
+   * It operates only on local paths.
+   *
+   * @param path the path to the directory. The path may include the wildcard.
+   * @return the list of jars as URLs, or an empty list if there are no jars, or
+   * the directory does not exist locally
+   */
+  public static List<Path> getJarsInDirectory(String path) {
+    return getJarsInDirectory(path, true);
+  }
+
+  /**
+   * Returns all jars that are in the directory. It is useful in expanding a
+   * wildcard path to return all jars from the directory to use in a classpath.
+   *
+   * @param path the path to the directory. The path may include the wildcard.
+   * @return the list of jars as URLs, or an empty list if there are no jars, or
+   * the directory does not exist
+   */
+  public static List<Path> getJarsInDirectory(String path, boolean useLocal) {
+    List<Path> paths = new ArrayList<>();
+    try {
+      // add the wildcard if it is not provided
+      if (!path.endsWith("*")) {
+        path += File.separator + "*";
+      }
+      Path globPath = new Path(path).suffix("{.jar,.JAR}");
+      FileContext context = useLocal ?
+          FileContext.getLocalFSFileContext() :
+          FileContext.getFileContext(globPath.toUri());
+      FileStatus[] files = context.util().globStatus(globPath);
+      if (files != null) {
+        for (FileStatus file: files) {
+          paths.add(file.getPath());
+        }
+      }
+    } catch (IOException ignore) {} // return the empty list
+    return paths;
+  }
+
+  public static boolean compareFs(FileSystem srcFs, FileSystem destFs) {
+    if (srcFs==null || destFs==null) {
+      return false;
+    }
+    URI srcUri = srcFs.getUri();
+    URI dstUri = destFs.getUri();
+    if (srcUri.getScheme()==null) {
+      return false;
+    }
+    if (!srcUri.getScheme().equals(dstUri.getScheme())) {
+      return false;
+    }
+    String srcHost = srcUri.getHost();
+    String dstHost = dstUri.getHost();
+    if ((srcHost!=null) && (dstHost!=null)) {
+      if (srcHost.equals(dstHost)) {
+        return srcUri.getPort()==dstUri.getPort();
+      }
+      try {
+        srcHost = InetAddress.getByName(srcHost).getCanonicalHostName();
+        dstHost = InetAddress.getByName(dstHost).getCanonicalHostName();
+      } catch (UnknownHostException ue) {
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("Could not compare file-systems. Unknown host: ", ue);
+        }
+        return false;
+      }
+      if (!srcHost.equals(dstHost)) {
+        return false;
+      }
+    } else if (srcHost==null && dstHost!=null) {
+      return false;
+    } else if (srcHost!=null) {
+      return false;
+    }
+    // check for ports
+    return srcUri.getPort()==dstUri.getPort();
   }
 }

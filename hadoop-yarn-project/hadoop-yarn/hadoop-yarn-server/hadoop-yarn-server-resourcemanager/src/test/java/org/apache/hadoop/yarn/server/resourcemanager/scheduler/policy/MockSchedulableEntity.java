@@ -31,9 +31,18 @@ public class MockSchedulableEntity implements SchedulableEntity {
   
   private String id;
   private long serial = 0;
-  
+  private Priority priority;
+  private boolean isRecovering;
+
   public MockSchedulableEntity() { }
   
+  public MockSchedulableEntity(long serial, int priority,
+      boolean isRecovering) {
+    this.serial = serial;
+    this.priority = Priority.newInstance(priority);
+    this.isRecovering = isRecovering;
+  }
+
   public void setId(String id) {
     this.id = id;
   }
@@ -74,5 +83,22 @@ public class MockSchedulableEntity implements SchedulableEntity {
     }
     return 1;//let other types go before this, if any
   }
-  
+
+  @Override
+  public Priority getPriority() {
+    return priority;
+  }
+
+  public void setApplicationPriority(Priority priority) {
+    this.priority = priority;
+  }
+
+  @Override
+  public boolean isRecovering() {
+    return isRecovering;
+  }
+
+  protected void setRecovering(boolean entityRecovering) {
+    this.isRecovering = entityRecovering;
+  }
 }

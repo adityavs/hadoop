@@ -17,9 +17,10 @@
  */
 package org.apache.hadoop.hdfs.server.blockmanagement;
 
+import com.google.common.base.Preconditions;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.hdfs.protocol.Block;
-import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
+import org.apache.hadoop.hdfs.protocol.BlockType;
 
 /**
  * Subclass of {@link BlockInfo}, used for a block with replication scheme.
@@ -36,41 +37,73 @@ public class BlockInfoContiguous extends BlockInfo {
   }
 
   /**
-   * Copy construction.
-   * This is used to convert BlockReplicationInfoUnderConstruction
-   * @param from BlockReplicationInfo to copy from.
+   * Ensure that there is enough  space to include num more storages.
+   * @return first free storage index.
    */
-  protected BlockInfoContiguous(BlockInfo from) {
-    super(from);
+  private int ensureCapacity(int num) {
+    assert this.storages != null : "BlockInfo is not initialized";
+    int last = numNodes();
+    if (storages.length >= (last+num)) {
+      return last;
+    }
+    /* Not enough space left. Create a new array. Should normally
+     * happen only when replication is manually increased by the user. */
+    DatanodeStorageInfo[] old = storages;
+    storages = new DatanodeStorageInfo[(last+num)];
+    System.arraycopy(old, 0, storages, 0, last);
+    return last;
   }
 
   @Override
-  boolean addStorage(DatanodeStorageInfo storage) {
-    return ContiguousBlockStorageOp.addStorage(this, storage);
+  boolean addStorage(DatanodeStorageInfo storage, Block reportedBlock) {
+    Preconditions.checkArgument(this.getBlockId() == reportedBlock.getBlockId(),
+        "reported blk_%s is different from stored blk_%s",
+        reportedBlock.getBlockId(), this.getBlockId());
+    // find the last null node
+    int lastNode = ensureCapacity(1);
+    setStorageInfo(lastNode, storage);
+    return true;
   }
 
   @Override
   boolean removeStorage(DatanodeStorageInfo storage) {
-    return ContiguousBlockStorageOp.removeStorage(this, storage);
+    int dnIndex = findStorageInfo(storage);
+    if (dnIndex < 0) { // the node is not found
+      return false;
+    }
+    // find the last not null node
+    int lastNode = numNodes()-1;
+    // replace current node entry by the lastNode one
+    setStorageInfo(dnIndex, getStorageInfo(lastNode));
+    // set the last entry to null
+    setStorageInfo(lastNode, null);
+    return true;
   }
 
   @Override
   public int numNodes() {
-    return ContiguousBlockStorageOp.numNodes(this);
+    assert this.storages != null : "BlockInfo is not initialized";
+
+    for (int idx = getCapacity()-1; idx >= 0; idx--) {
+      if (getDatanode(idx) != null) {
+        return idx + 1;
+      }
+    }
+    return 0;
   }
 
   @Override
-  void replaceBlock(BlockInfo newBlock) {
-    ContiguousBlockStorageOp.replaceBlock(this, newBlock);
+  public final boolean isStriped() {
+    return false;
   }
 
   @Override
-  BlockInfoUnderConstruction convertCompleteBlockToUC(
-      HdfsServerConstants.BlockUCState s, DatanodeStorageInfo[] targets) {
-    BlockInfoUnderConstructionContiguous ucBlock =
-        new BlockInfoUnderConstructionContiguous(this,
-            getBlockCollection().getPreferredBlockReplication(), s, targets);
-    ucBlock.setBlockCollection(getBlockCollection());
-    return ucBlock;
+  public BlockType getBlockType() {
+    return BlockType.CONTIGUOUS;
+  }
+
+  @Override
+  final boolean hasNoStorage() {
+    return getStorageInfo(0) == null;
   }
 }

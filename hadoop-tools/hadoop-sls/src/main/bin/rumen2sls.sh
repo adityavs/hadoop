@@ -55,8 +55,7 @@ function parse_args()
 
 function calculate_classpath()
 {
-  hadoop_debug "Injecting TOOL_PATH into CLASSPATH"
-  hadoop_add_classpath "${TOOL_PATH}"
+  hadoop_add_to_classpath_tools hadoop-rumen
 }
 
 function run_sls_generator()
@@ -69,8 +68,7 @@ function run_sls_generator()
   hadoop_add_param args -outputJobs "-outputJobs ${outputdir}/${outputprefix}-jobs.json"
   hadoop_add_param args -outputNodes "-outputNodes ${outputdir}/${outputprefix}-nodes.json"
 
-  hadoop_debug "Appending HADOOP_CLIENT_OPTS onto HADOOP_OPTS"
-  HADOOP_OPTS="${HADOOP_OPTS} ${HADOOP_CLIENT_OPTS}"
+  hadoop_add_client_opts
 
   hadoop_finalize
   # shellcheck disable=SC2086
@@ -78,15 +76,15 @@ function run_sls_generator()
 }
 
 # let's locate libexec...
-if [[ -n "${HADOOP_PREFIX}" ]]; then
-  DEFAULT_LIBEXEC_DIR="${HADOOP_PREFIX}/libexec"
+if [[ -n "${HADOOP_HOME}" ]]; then
+  HADOOP_DEFAULT_LIBEXEC_DIR="${HADOOP_HOME}/libexec"
 else
   this="${BASH_SOURCE-$0}"
   bin=$(cd -P -- "$(dirname -- "${this}")" >/dev/null && pwd -P)
-  DEFAULT_LIBEXEC_DIR="${bin}/../../../../../libexec"
+  HADOOP_DEFAULT_LIBEXEC_DIR="${bin}/../../../../../libexec"
 fi
 
-HADOOP_LIBEXEC_DIR="${HADOOP_LIBEXEC_DIR:-$DEFAULT_LIBEXEC_DIR}"
+HADOOP_LIBEXEC_DIR="${HADOOP_LIBEXEC_DIR:-$HADOOP_DEFAULT_LIBEXEC_DIR}"
 # shellcheck disable=SC2034
 HADOOP_NEW_CONFIG=true
 if [[ -f "${HADOOP_LIBEXEC_DIR}/hadoop-config.sh" ]]; then

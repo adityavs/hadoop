@@ -36,6 +36,7 @@ import org.apache.hadoop.yarn.api.protocolrecords.ReleaseSharedCacheResourceRequ
 import org.apache.hadoop.yarn.api.protocolrecords.UseSharedCacheResourceRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.UseSharedCacheResourceResponse;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
+import org.apache.hadoop.yarn.api.records.URL;
 import org.apache.hadoop.yarn.client.api.SharedCacheClient;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.exceptions.YarnException;
@@ -111,7 +112,7 @@ public class SharedCacheClientImpl extends SharedCacheClient {
   }
 
   @Override
-  public Path use(ApplicationId applicationId, String resourceKey)
+  public URL use(ApplicationId applicationId, String resourceKey)
       throws YarnException {
     Path resourcePath = null;
     UseSharedCacheResourceRequest request = Records.newRecord(
@@ -129,7 +130,13 @@ public class SharedCacheClientImpl extends SharedCacheClient {
       // We don't handle different exceptions separately at this point.
       throw new YarnException(e);
     }
-    return resourcePath;
+    if (resourcePath != null) {
+      URL pathURL = URL.fromPath(resourcePath);
+      return pathURL;
+    } else {
+      // The resource was not in the cache.
+      return null;
+    }
   }
 
   @Override

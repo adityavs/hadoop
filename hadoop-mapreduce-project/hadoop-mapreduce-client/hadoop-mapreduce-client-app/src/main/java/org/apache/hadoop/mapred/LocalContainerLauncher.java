@@ -20,13 +20,18 @@ package org.apache.hadoop.mapred;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.lang.management.RuntimeMXBean;
+import java.lang.management.ThreadInfo;
+import java.lang.management.ThreadMXBean;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
+import java.util.Collections;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 
@@ -60,6 +65,7 @@ import org.apache.hadoop.service.AbstractService;
 import org.apache.hadoop.util.ExitUtil;
 import org.apache.hadoop.util.ShutdownHookManager;
 import org.apache.hadoop.util.StringUtils;
+import org.apache.hadoop.util.concurrent.HadoopExecutors;
 import org.apache.hadoop.yarn.api.ApplicationConstants.Environment;
 import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
 
@@ -77,7 +83,7 @@ public class LocalContainerLauncher extends AbstractService implements
   private static final Log LOG = LogFactory.getLog(LocalContainerLauncher.class);
 
   private FileContext curFC = null;
-  private final HashSet<File> localizedFiles;
+  private Set<File> localizedFiles = new HashSet<File>();
   private final AppContext context;
   private final TaskUmbilicalProtocol umbilical;
   private final ClassLoader jobClassLoader;
@@ -117,9 +123,12 @@ public class LocalContainerLauncher extends AbstractService implements
     // users who do that get what they deserve (and will have to disable
     // uberization in order to run correctly).
     File[] curLocalFiles = curDir.listFiles();
-    localizedFiles = new HashSet<File>(curLocalFiles.length);
-    for (int j = 0; j < curLocalFiles.length; ++j) {
-      localizedFiles.add(curLocalFiles[j]);
+    if (curLocalFiles != null) {
+      HashSet<File> lf = new HashSet<File>(curLocalFiles.length);
+      for (int j = 0; j < curLocalFiles.length; ++j) {
+        lf.add(curLocalFiles[j]);
+      }
+      localizedFiles = Collections.unmodifiableSet(lf);
     }
 
     // Relocalization note/future FIXME (per chrisdo, 20110315):  At moment,
@@ -138,7 +147,7 @@ public class LocalContainerLauncher extends AbstractService implements
     // make it a daemon thread so that the process can exit even if the task is
     // not interruptible
     taskRunner =
-        Executors.newSingleThreadExecutor(new ThreadFactoryBuilder().
+        HadoopExecutors.newSingleThreadExecutor(new ThreadFactoryBuilder().
             setDaemon(true).setNameFormat("uber-SubtaskRunner").build());
     // create and start an event handling thread
     eventHandler = new Thread(new EventHandler(), "uber-EventHandler");
@@ -233,7 +242,7 @@ public class LocalContainerLauncher extends AbstractService implements
         try {
           event = eventQueue.take();
         } catch (InterruptedException e) {  // mostly via T_KILL? JOB_KILL?
-          LOG.error("Returning, interrupted : " + e);
+          LOG.warn("Returning, interrupted : " + e);
           break;
         }
 
@@ -254,6 +263,30 @@ public class LocalContainerLauncher extends AbstractService implements
           futures.put(event.getTaskAttemptID(), future);
 
         } else if (event.getType() == EventType.CONTAINER_REMOTE_CLEANUP) {
+
+          if (event.getDumpContainerThreads()) {
+            try {
+              // Construct full thread dump header
+              System.out.println(new java.util.Date());
+              RuntimeMXBean rtBean = ManagementFactory.getRuntimeMXBean();
+              System.out.println("Full thread dump " + rtBean.getVmName()
+                  + " (" + rtBean.getVmVersion()
+                  + " " + rtBean.getSystemProperties().get("java.vm.info")
+                  + "):\n");
+              // Dump threads' states and stacks
+              ThreadMXBean tmxBean = ManagementFactory.getThreadMXBean();
+              ThreadInfo[] tInfos = tmxBean.dumpAllThreads(
+                  tmxBean.isObjectMonitorUsageSupported(),
+                  tmxBean.isSynchronizerUsageSupported());
+              for (ThreadInfo ti : tInfos) {
+                System.out.println(ti.toString());
+              }
+            } catch (Throwable t) {
+              // Failure to dump stack shouldn't cause method failure.
+              System.out.println("Could not create full thread dump: "
+                  + t.getMessage());
+            }
+          }
 
           // cancel (and interrupt) the current running task associated with the
           // event
@@ -493,26 +526,29 @@ public class LocalContainerLauncher extends AbstractService implements
      */
     private void relocalize() {
       File[] curLocalFiles = curDir.listFiles();
-      for (int j = 0; j < curLocalFiles.length; ++j) {
-        if (!localizedFiles.contains(curLocalFiles[j])) {
-          // found one that wasn't there before:  delete it
-          boolean deleted = false;
-          try {
-            if (curFC != null) {
-              // this is recursive, unlike File delete():
-              deleted = curFC.delete(new Path(curLocalFiles[j].getName()),true);
+      if (curLocalFiles != null) {
+        for (int j = 0; j < curLocalFiles.length; ++j) {
+          if (!localizedFiles.contains(curLocalFiles[j])) {
+            // found one that wasn't there before:  delete it
+            boolean deleted = false;
+            try {
+              if (curFC != null) {
+                // this is recursive, unlike File delete():
+                deleted =
+                    curFC.delete(new Path(curLocalFiles[j].getName()), true);
+              }
+            } catch (IOException e) {
+              deleted = false;
             }
-          } catch (IOException e) {
-            deleted = false;
-          }
-          if (!deleted) {
-            LOG.warn("Unable to delete unexpected local file/dir "
-                + curLocalFiles[j].getName() + ": insufficient permissions?");
+            if (!deleted) {
+              LOG.warn("Unable to delete unexpected local file/dir "
+                  + curLocalFiles[j].getName()
+                  + ": insufficient permissions?");
+            }
           }
         }
       }
     }
-
   } // end EventHandler
 
   /**

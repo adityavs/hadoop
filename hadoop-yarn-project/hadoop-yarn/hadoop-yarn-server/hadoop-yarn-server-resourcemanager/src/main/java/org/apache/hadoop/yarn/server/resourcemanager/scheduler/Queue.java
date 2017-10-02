@@ -24,6 +24,7 @@ import java.util.Set;
 import org.apache.hadoop.classification.InterfaceAudience.LimitedPrivate;
 import org.apache.hadoop.classification.InterfaceStability.Evolving;
 import org.apache.hadoop.security.UserGroupInformation;
+import org.apache.hadoop.yarn.api.records.Priority;
 import org.apache.hadoop.yarn.api.records.QueueACL;
 import org.apache.hadoop.yarn.api.records.QueueInfo;
 import org.apache.hadoop.yarn.api.records.QueueUserACLInfo;
@@ -62,7 +63,7 @@ public interface Queue {
 
   boolean hasAccess(QueueACL acl, UserGroupInformation user);
   
-  public ActiveUsersManager getActiveUsersManager();
+  public AbstractUsersManager getAbstractUsersManager();
 
   /**
    * Recover the state of the queue for a given container.
@@ -110,4 +111,31 @@ public interface Queue {
    *          new resource asked
    */
   public void decPendingResource(String nodeLabel, Resource resourceToDec);
+
+  /**
+   * Get the Default Application Priority for this queue
+   *
+   * @return default application priority
+   */
+  public Priority getDefaultApplicationPriority();
+
+  /**
+   * Increment Reserved Capacity
+   *
+   * @param partition
+   *          asked by application
+   * @param reservedRes
+   *          reserved resource asked
+   */
+  public void incReservedResource(String partition, Resource reservedRes);
+
+  /**
+   * Decrement Reserved Capacity
+   *
+   * @param partition
+   *          asked by application
+   * @param reservedRes
+   *          reserved resource asked
+   */
+  public void decReservedResource(String partition, Resource reservedRes);
 }

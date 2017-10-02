@@ -44,6 +44,7 @@ import org.apache.hadoop.hdfs.shortcircuit.ShortCircuitShm.SlotId;
 import org.apache.hadoop.io.nativeio.SharedFileDescriptorFactory;
 import org.apache.hadoop.net.unix.DomainSocket;
 import org.apache.hadoop.net.unix.DomainSocketWatcher;
+import org.apache.hadoop.hdfs.shortcircuit.DfsClientShmManager;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
@@ -165,7 +166,7 @@ public class ShortCircuitRegistry {
             DFS_SHORT_CIRCUIT_SHARED_MEMORY_WATCHER_INTERRUPT_CHECK_MS +
             " was set to " + interruptCheck);
       }
-      String shmPaths[] =
+      String[] shmPaths =
           conf.getTrimmedStrings(DFS_DATANODE_SHARED_FILE_DESCRIPTOR_PATHS);
       if (shmPaths.length == 0) {
         shmPaths =
@@ -263,12 +264,20 @@ public class ShortCircuitRegistry {
   }
 
   public static class NewShmInfo implements Closeable {
-    public final ShmId shmId;
-    public final FileInputStream stream;
+    private final ShmId shmId;
+    private final FileInputStream stream;
 
     NewShmInfo(ShmId shmId, FileInputStream stream) {
       this.shmId = shmId;
       this.stream = stream;
+    }
+
+    public ShmId getShmId() {
+      return shmId;
+    }
+
+    public FileInputStream getFileStream() {
+      return stream;
     }
 
     @Override
@@ -386,12 +395,12 @@ public class ShortCircuitRegistry {
   }
 
   public static interface Visitor {
-    void accept(HashMap<ShmId, RegisteredShm> segments,
+    boolean accept(HashMap<ShmId, RegisteredShm> segments,
                 HashMultimap<ExtendedBlockId, Slot> slots);
   }
 
   @VisibleForTesting
-  public synchronized void visit(Visitor visitor) {
-    visitor.accept(segments, slots);
+  public synchronized boolean visit(Visitor visitor) {
+    return visitor.accept(segments, slots);
   }
 }

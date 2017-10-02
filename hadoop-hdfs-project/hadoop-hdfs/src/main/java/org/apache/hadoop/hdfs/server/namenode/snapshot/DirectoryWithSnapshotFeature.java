@@ -30,7 +30,6 @@ import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.hdfs.protocol.QuotaExceededException;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockStoragePolicySuite;
 import org.apache.hadoop.hdfs.server.namenode.AclStorage;
-import org.apache.hadoop.hdfs.server.namenode.Content;
 import org.apache.hadoop.hdfs.server.namenode.ContentCounts;
 import org.apache.hadoop.hdfs.server.namenode.ContentSummaryComputationContext;
 import org.apache.hadoop.hdfs.server.namenode.FSImageSerialization;
@@ -48,6 +47,7 @@ import org.apache.hadoop.hdfs.util.Diff.UndoInfo;
 import org.apache.hadoop.hdfs.util.ReadOnlyList;
 
 import com.google.common.base.Preconditions;
+import org.apache.hadoop.security.AccessControlException;
 
 import static org.apache.hadoop.hdfs.server.namenode.snapshot.Snapshot.NO_SNAPSHOT_ID;
 
@@ -453,7 +453,16 @@ public class DirectoryWithSnapshotFeature implements INode.Feature {
       if (topNode instanceof INodeReference.WithName) {
         INodeReference.WithName wn = (INodeReference.WithName) topNode;
         if (wn.getLastSnapshotId() >= post) {
-          wn.cleanSubtree(reclaimContext, post, prior);
+          INodeReference.WithCount wc =
+              (INodeReference.WithCount) wn.getReferredINode();
+          if (wc.getLastWithName() == wn && wc.getParentReference() == null) {
+            // this wn is the last wn inside of the wc, also the dstRef node has
+            // been deleted. In this case, we should treat the referred file/dir
+            // as normal case
+            queue.add(wc.getReferredINode());
+          } else {
+            wn.cleanSubtree(reclaimContext, post, prior);
+          }
         }
         // For DstReference node, since the node is not in the created list of
         // prior, we should treat it as regular file/dir
@@ -622,19 +631,17 @@ public class DirectoryWithSnapshotFeature implements INode.Feature {
   }
 
   public void computeContentSummary4Snapshot(final BlockStoragePolicySuite bsps,
-      final ContentCounts counts) {
+      final ContentCounts counts) throws AccessControlException {
     // Create a new blank summary context for blocking processing of subtree.
     ContentSummaryComputationContext summary = 
         new ContentSummaryComputationContext(bsps);
     for(DirectoryDiff d : diffs) {
       for(INode deleted : d.getChildrenDiff().getList(ListType.DELETED)) {
-        deleted.computeContentSummary(summary);
+        deleted.computeContentSummary(Snapshot.CURRENT_STATE_ID, summary);
       }
     }
     // Add the counts from deleted trees.
     counts.addContents(summary.getCounts());
-    // Add the deleted directory count.
-    counts.addContent(Content.DIRECTORY, diffs.asList().size());
   }
   
   /**

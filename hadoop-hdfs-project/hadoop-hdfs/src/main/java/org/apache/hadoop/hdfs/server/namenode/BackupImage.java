@@ -55,7 +55,7 @@ public class BackupImage extends FSImage {
    *   stopApplyingOnNextRoll is true.
    */
   volatile BNState bnState;
-  static enum BNState {
+  enum BNState {
     /**
      * Edits from the NN should be dropped. On the next log roll,
      * transition to JOURNAL_ONLY state
@@ -81,6 +81,8 @@ public class BackupImage extends FSImage {
   private boolean stopApplyingEditsOnNextRoll = false;
   
   private FSNamesystem namesystem;
+
+  private int quotaInitThreads;
 
   /**
    * Construct a backup image.
@@ -198,7 +200,7 @@ public class BackupImage extends FSImage {
     assert backupInputStream.length() == 0 : "backup input stream is not empty";
     try {
       if (LOG.isTraceEnabled()) {
-        LOG.debug("data:" + StringUtils.byteToHexString(data));
+        LOG.trace("data:" + StringUtils.byteToHexString(data));
       }
 
       FSEditLogLoader logLoader =
@@ -216,9 +218,7 @@ public class BackupImage extends FSImage {
       }
       lastAppliedTxId = logLoader.getLastAppliedTxId();
 
-      FSImage.updateCountForQuota(
-          getNamesystem().dir.getBlockStoragePolicySuite(),
-          getNamesystem().dir.rootDir); // inefficient!
+      getNamesystem().dir.updateCountForQuota();
     } finally {
       backupInputStream.clear();
     }

@@ -30,6 +30,11 @@ import org.mockito.Mockito;
 public class TestNodeManagerHardwareUtils {
 
   static class TestResourceCalculatorPlugin extends ResourceCalculatorPlugin {
+
+    TestResourceCalculatorPlugin() {
+      super(null);
+    }
+
     @Override
     public long getVirtualMemorySize() {
       return 0;
@@ -68,7 +73,7 @@ public class TestNodeManagerHardwareUtils {
     }
 
     @Override
-    public float getCpuUsage() {
+    public float getCpuUsagePercentage() {
       return 0;
     }
 
@@ -167,7 +172,7 @@ public class TestNodeManagerHardwareUtils {
     YarnConfiguration conf = new YarnConfiguration();
     conf.setBoolean(YarnConfiguration.NM_ENABLE_HARDWARE_CAPABILITY_DETECTION,
         true);
-    int mem = NodeManagerHardwareUtils.getContainerMemoryMB(null, conf);
+    long mem = NodeManagerHardwareUtils.getContainerMemoryMB(null, conf);
     Assert.assertEquals(YarnConfiguration.DEFAULT_NM_PMEM_MB, mem);
 
     mem = NodeManagerHardwareUtils.getContainerMemoryMB(plugin, conf);

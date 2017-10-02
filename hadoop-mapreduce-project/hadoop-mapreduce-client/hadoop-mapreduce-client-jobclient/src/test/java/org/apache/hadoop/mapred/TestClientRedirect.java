@@ -70,6 +70,12 @@ import org.apache.hadoop.service.AbstractService;
 import org.apache.hadoop.yarn.api.ApplicationClientProtocol;
 import org.apache.hadoop.yarn.api.protocolrecords.CancelDelegationTokenRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.CancelDelegationTokenResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.FailApplicationAttemptRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.FailApplicationAttemptResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.GetAllResourceProfilesRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.GetAllResourceProfilesResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.GetAllResourceTypeInfoRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.GetAllResourceTypeInfoResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationAttemptReportRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationAttemptReportResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationAttemptsRequest;
@@ -94,12 +100,16 @@ import org.apache.hadoop.yarn.api.protocolrecords.GetLabelsToNodesRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetLabelsToNodesResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetNewApplicationRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetNewApplicationResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.GetNewReservationRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.GetNewReservationResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetNodesToLabelsRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetNodesToLabelsResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetQueueInfoRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetQueueInfoResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetQueueUserAclsInfoRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetQueueUserAclsInfoResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.GetResourceProfileRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.GetResourceProfileResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.KillApplicationRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.KillApplicationResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.MoveApplicationAcrossQueuesRequest;
@@ -108,12 +118,20 @@ import org.apache.hadoop.yarn.api.protocolrecords.RenewDelegationTokenRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.RenewDelegationTokenResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.ReservationDeleteRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.ReservationDeleteResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.ReservationListRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.ReservationListResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.ReservationSubmissionRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.ReservationSubmissionResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.ReservationUpdateRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.ReservationUpdateResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.SignalContainerRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.SignalContainerResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.SubmitApplicationRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.SubmitApplicationResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.UpdateApplicationPriorityRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.UpdateApplicationPriorityResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.UpdateApplicationTimeoutsRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.UpdateApplicationTimeoutsResponse;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.ApplicationReport;
 import org.apache.hadoop.yarn.api.records.FinalApplicationStatus;
@@ -324,6 +342,12 @@ public class TestClientRedirect {
     }
 
     @Override
+    public FailApplicationAttemptResponse failApplicationAttempt(
+        FailApplicationAttemptRequest request) throws IOException {
+      return recordFactory.newRecordInstance(FailApplicationAttemptResponse.class);
+    }
+
+    @Override
     public KillApplicationResponse forceKillApplication(
         KillApplicationRequest request) throws IOException {
       return KillApplicationResponse.newInstance(true);
@@ -410,6 +434,12 @@ public class TestClientRedirect {
     }
 
     @Override
+    public GetNewReservationResponse getNewReservation(
+        GetNewReservationRequest request) throws YarnException, IOException {
+      return null;
+    }
+
+    @Override
     public ReservationSubmissionResponse submitReservation(
         ReservationSubmissionRequest request) throws YarnException, IOException {
       return null;
@@ -428,6 +458,12 @@ public class TestClientRedirect {
     }
 
     @Override
+    public ReservationListResponse listReservations(
+            ReservationListRequest request) throws YarnException, IOException {
+      return null;
+    }
+
+    @Override
     public GetNodesToLabelsResponse getNodeToLabels(
         GetNodesToLabelsRequest request) throws YarnException, IOException {
       return null;
@@ -442,6 +478,46 @@ public class TestClientRedirect {
     @Override
     public GetLabelsToNodesResponse getLabelsToNodes(
         GetLabelsToNodesRequest request) throws YarnException, IOException {
+      return null;
+    }
+
+    @Override
+    public UpdateApplicationPriorityResponse updateApplicationPriority(
+        UpdateApplicationPriorityRequest request) throws YarnException,
+        IOException {
+      return null;
+    }
+
+    @Override
+    public SignalContainerResponse signalToContainer(
+        SignalContainerRequest request) throws IOException {
+      return null;
+    }
+
+    @Override
+    public UpdateApplicationTimeoutsResponse updateApplicationTimeouts(
+        UpdateApplicationTimeoutsRequest request)
+        throws YarnException, IOException {
+      return null;
+    }
+
+    @Override
+    public GetAllResourceProfilesResponse getResourceProfiles(
+        GetAllResourceProfilesRequest request)
+        throws YarnException, IOException {
+      return null;
+    }
+
+    @Override
+    public GetResourceProfileResponse getResourceProfile(
+        GetResourceProfileRequest request) throws YarnException, IOException {
+      return null;
+    }
+
+    @Override
+    public GetAllResourceTypeInfoResponse getResourceTypeInfo(
+        GetAllResourceTypeInfoRequest request)
+        throws YarnException, IOException {
       return null;
     }
   }

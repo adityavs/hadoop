@@ -20,9 +20,10 @@
 
 package org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.privileged;
 
+import com.google.common.annotations.VisibleForTesting;
 import org.apache.commons.lang.StringUtils;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.conf.Configuration;
@@ -45,7 +46,8 @@ import java.util.Map;
 @InterfaceAudience.Private
 @InterfaceStability.Unstable
 public class PrivilegedOperationExecutor {
-  private static final Log LOG = LogFactory.getLog(PrivilegedOperationExecutor
+  private static final Logger LOG =
+       LoggerFactory.getLogger(PrivilegedOperationExecutor
       .class);
   private volatile static PrivilegedOperationExecutor instance;
 
@@ -101,7 +103,13 @@ public class PrivilegedOperationExecutor {
     }
 
     fullCommand.add(containerExecutorExe);
-    fullCommand.add(operation.getOperationType().getOption());
+
+    String cliSwitch = operation.getOperationType().getOption();
+
+    if (!cliSwitch.isEmpty()) {
+      fullCommand.add(cliSwitch);
+    }
+
     fullCommand.addAll(operation.getArguments());
 
     String[] fullCommandArray =
@@ -126,33 +134,50 @@ public class PrivilegedOperationExecutor {
    * @param workingDir     (optional) working directory for execution
    * @param env            (optional) env of the command will include specified vars
    * @param grabOutput     return (possibly large) shell command output
+   * @param inheritParentEnv inherit the env vars from the parent process
    * @return stdout contents from shell executor - useful for some privileged
    * operations - e.g --tc_read
    * @throws org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.privileged.PrivilegedOperationException
    */
   public String executePrivilegedOperation(List<String> prefixCommands,
       PrivilegedOperation operation, File workingDir,
-      Map<String, String> env, boolean grabOutput)
+      Map<String, String> env, boolean grabOutput, boolean inheritParentEnv)
       throws PrivilegedOperationException {
     String[] fullCommandArray = getPrivilegedOperationExecutionCommand
         (prefixCommands, operation);
     ShellCommandExecutor exec = new ShellCommandExecutor(fullCommandArray,
-        workingDir, env);
+        workingDir, env, 0L, inheritParentEnv);
 
     try {
       exec.execute();
       if (LOG.isDebugEnabled()) {
+        LOG.debug("command array:");
+        LOG.debug(Arrays.toString(fullCommandArray));
         LOG.debug("Privileged Execution Operation Output:");
         LOG.debug(exec.getOutput());
       }
     } catch (ExitCodeException e) {
-      String logLine = new StringBuffer("Shell execution returned exit code: ")
-          .append(exec.getExitCode())
-          .append(". Privileged Execution Operation Output: ")
-          .append(System.lineSeparator()).append(exec.getOutput()).toString();
+      if (operation.isFailureLoggingEnabled()) {
+        StringBuilder logBuilder = new StringBuilder("Shell execution returned "
+            + "exit code: ")
+            .append(exec.getExitCode())
+            .append(". Privileged Execution Operation Stderr: ")
+            .append(System.lineSeparator())
+            .append(e.getMessage())
+            .append(System.lineSeparator())
+            .append("Stdout: " + exec.getOutput())
+            .append(System.lineSeparator());
+        logBuilder.append("Full command array for failed execution: ")
+            .append(System.lineSeparator());
+        logBuilder.append(Arrays.toString(fullCommandArray));
 
-      LOG.warn(logLine);
-      throw new PrivilegedOperationException(e);
+        LOG.warn(logBuilder.toString());
+      }
+
+      //stderr from shell executor seems to be stuffed into the exception
+      //'message' - so, we have to extract it and set it as the error out
+      throw new PrivilegedOperationException(e, e.getExitCode(),
+          exec.getOutput(), e.getMessage());
     } catch (IOException e) {
       LOG.warn("IOException executing command: ", e);
       throw new PrivilegedOperationException(e);
@@ -178,7 +203,8 @@ public class PrivilegedOperationExecutor {
    */
   public String executePrivilegedOperation(PrivilegedOperation operation,
       boolean grabOutput) throws PrivilegedOperationException {
-    return executePrivilegedOperation(null, operation, null, null, grabOutput);
+    return executePrivilegedOperation(null, operation, null, null, grabOutput,
+        false);
   }
 
   //Utility functions for squashing together operations in supported ways
@@ -202,7 +228,7 @@ public class PrivilegedOperationExecutor {
 
     StringBuffer finalOpArg = new StringBuffer(PrivilegedOperation
         .CGROUP_ARG_PREFIX);
-    boolean noneArgsOnly = true;
+    boolean noTasks = true;
 
     for (PrivilegedOperation op : ops) {
       if (!op.getOperationType()
@@ -227,23 +253,24 @@ public class PrivilegedOperationExecutor {
         throw new PrivilegedOperationException("Invalid argument: " + arg);
       }
 
-      if (tasksFile.equals("none")) {
+      if (tasksFile.equals(PrivilegedOperation.CGROUP_ARG_NO_TASKS)) {
         //Don't append to finalOpArg
         continue;
       }
 
-      if (noneArgsOnly == false) {
+      if (noTasks == false) {
         //We have already appended at least one tasks file.
-        finalOpArg.append(",");
+        finalOpArg.append(PrivilegedOperation.LINUX_FILE_PATH_SEPARATOR);
         finalOpArg.append(tasksFile);
       } else {
         finalOpArg.append(tasksFile);
-        noneArgsOnly = false;
+        noTasks = false;
       }
     }
 
-    if (noneArgsOnly) {
-      finalOpArg.append("none"); //there were no tasks file to append
+    if (noTasks) {
+      finalOpArg.append(PrivilegedOperation.CGROUP_ARG_NO_TASKS); //there
+      // were no tasks file to append
     }
 
     PrivilegedOperation finalOp = new PrivilegedOperation(

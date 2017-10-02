@@ -28,7 +28,6 @@ import java.util.Map;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.apache.commons.logging.impl.Log4JLogger;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
@@ -43,6 +42,7 @@ import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
 import org.apache.hadoop.hdfs.protocol.DirectoryListing;
+import org.apache.hadoop.hdfs.protocol.HdfsConstants;
 import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
 import org.apache.hadoop.hdfs.protocol.HdfsLocatedFileStatus;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
@@ -53,7 +53,6 @@ import org.apache.hadoop.hdfs.server.balancer.ExitStatus;
 import org.apache.hadoop.hdfs.server.balancer.TestBalancer;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockPlacementPolicy;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockStoragePolicySuite;
-import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
 import org.apache.hadoop.hdfs.server.datanode.DataNode;
 import org.apache.hadoop.hdfs.server.datanode.DataNodeTestUtils;
 import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsDatasetSpi;
@@ -61,6 +60,7 @@ import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsVolumeSpi;
 import org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsVolumeImpl;
 import org.apache.hadoop.hdfs.server.namenode.snapshot.SnapshotTestHelper;
 import org.apache.hadoop.io.IOUtils;
+import org.apache.hadoop.test.GenericTestUtils;
 import org.apache.log4j.Level;
 import org.junit.Assert;
 import org.junit.Test;
@@ -74,12 +74,11 @@ import com.google.common.collect.Maps;
 public class TestStorageMover {
   static final Log LOG = LogFactory.getLog(TestStorageMover.class);
   static {
-    ((Log4JLogger)LogFactory.getLog(BlockPlacementPolicy.class)
-        ).getLogger().setLevel(Level.ALL);
-    ((Log4JLogger)LogFactory.getLog(Dispatcher.class)
-        ).getLogger().setLevel(Level.ALL);
-    ((Log4JLogger)LogFactory.getLog(DataTransferProtocol.class)).getLogger()
-        .setLevel(Level.ALL);
+    GenericTestUtils.setLogLevel(LogFactory.getLog(BlockPlacementPolicy.class),
+        Level.ALL);
+    GenericTestUtils.setLogLevel(LogFactory.getLog(Dispatcher.class),
+        Level.ALL);
+    GenericTestUtils.setLogLevel(DataTransferProtocol.LOG, Level.ALL);
   }
 
   private static final int BLOCK_SIZE = 1024;
@@ -94,14 +93,14 @@ public class TestStorageMover {
   static {
     DEFAULT_CONF.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY, BLOCK_SIZE);
     DEFAULT_CONF.setLong(DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_KEY, 1L);
-    DEFAULT_CONF.setLong(DFSConfigKeys.DFS_NAMENODE_REPLICATION_INTERVAL_KEY,
-        2L);
+    DEFAULT_CONF.setLong(
+        DFSConfigKeys.DFS_NAMENODE_REDUNDANCY_INTERVAL_SECONDS_KEY, 2L);
     DEFAULT_CONF.setLong(DFSConfigKeys.DFS_MOVER_MOVEDWINWIDTH_KEY, 2000L);
 
     DEFAULT_POLICIES = BlockStoragePolicySuite.createDefaultSuite();
-    HOT = DEFAULT_POLICIES.getPolicy(HdfsServerConstants.HOT_STORAGE_POLICY_NAME);
-    WARM = DEFAULT_POLICIES.getPolicy(HdfsServerConstants.WARM_STORAGE_POLICY_NAME);
-    COLD = DEFAULT_POLICIES.getPolicy(HdfsServerConstants.COLD_STORAGE_POLICY_NAME);
+    HOT = DEFAULT_POLICIES.getPolicy(HdfsConstants.HOT_STORAGE_POLICY_NAME);
+    WARM = DEFAULT_POLICIES.getPolicy(HdfsConstants.WARM_STORAGE_POLICY_NAME);
+    COLD = DEFAULT_POLICIES.getPolicy(HdfsConstants.COLD_STORAGE_POLICY_NAME);
     TestBalancer.initTestSetup();
     Dispatcher.setDelayAfterErrors(1000L);
   }
@@ -268,7 +267,7 @@ public class TestStorageMover {
     }
 
     private void runMover(ExitStatus expectedExitCode) throws Exception {
-      Collection<URI> namenodes = DFSUtil.getNsServiceRpcUris(conf);
+      Collection<URI> namenodes = DFSUtil.getInternalNsRpcUris(conf);
       Map<URI, List<Path>> nnMap = Maps.newHashMap();
       for (URI nn : namenodes) {
         nnMap.put(nn, null);
@@ -284,7 +283,7 @@ public class TestStorageMover {
 
     private void verifyRecursively(final Path parent,
         final HdfsFileStatus status) throws Exception {
-      if (status.isDir()) {
+      if (status.isDirectory()) {
         Path fullPath = parent == null ?
             new Path("/") : status.getFullPath(parent);
         DirectoryListing children = dfs.getClient().listPaths(
@@ -614,8 +613,10 @@ public class TestStorageMover {
   }
 
   private void waitForAllReplicas(int expectedReplicaNum, Path file,
-      DistributedFileSystem dfs) throws Exception {
-    for (int i = 0; i < 5; i++) {
+      DistributedFileSystem dfs, int retryCount) throws Exception {
+    LOG.info("Waiting for replicas count " + expectedReplicaNum
+        + ", file name: " + file);
+    for (int i = 0; i < retryCount; i++) {
       LocatedBlocks lbs = dfs.getClient().getLocatedBlocks(file.toString(), 0,
           BLOCK_SIZE);
       LocatedBlock lb = lbs.get(0);
@@ -665,7 +666,7 @@ public class TestStorageMover {
       for (int i = 0; i < 2; i++) {
         final Path p = new Path(pathPolicyMap.hot, "file" + i);
         DFSTestUtil.createFile(test.dfs, p, BLOCK_SIZE, replication, 0L);
-        waitForAllReplicas(replication, p, test.dfs);
+        waitForAllReplicas(replication, p, test.dfs, 10);
       }
 
       // set all the DISK volume to full
@@ -680,16 +681,17 @@ public class TestStorageMover {
       final Replication r = test.getReplication(file0);
       final short newReplication = (short) 5;
       test.dfs.setReplication(file0, newReplication);
-      Thread.sleep(10000);
+      waitForAllReplicas(newReplication, file0, test.dfs, 10);
       test.verifyReplication(file0, r.disk, newReplication - r.disk);
 
       // test creating a cold file and then increase replication
       final Path p = new Path(pathPolicyMap.cold, "foo");
       DFSTestUtil.createFile(test.dfs, p, BLOCK_SIZE, replication, 0L);
+      waitForAllReplicas(replication, p, test.dfs, 10);
       test.verifyReplication(p, 0, replication);
 
       test.dfs.setReplication(p, newReplication);
-      Thread.sleep(10000);
+      waitForAllReplicas(newReplication, p, test.dfs, 10);
       test.verifyReplication(p, 0, newReplication);
 
       //test move a hot file to warm
@@ -723,7 +725,7 @@ public class TestStorageMover {
       for (int i = 0; i < 2; i++) {
         final Path p = new Path(pathPolicyMap.cold, "file" + i);
         DFSTestUtil.createFile(test.dfs, p, BLOCK_SIZE, replication, 0L);
-        waitForAllReplicas(replication, p, test.dfs);
+        waitForAllReplicas(replication, p, test.dfs, 10);
       }
 
       // set all the ARCHIVE volume to full
@@ -740,7 +742,7 @@ public class TestStorageMover {
 
         final short newReplication = (short) 5;
         test.dfs.setReplication(file0, newReplication);
-        Thread.sleep(10000);
+        waitForAllReplicas(r.archive, file0, test.dfs, 10);
 
         test.verifyReplication(file0, 0, r.archive);
       }

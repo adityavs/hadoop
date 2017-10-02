@@ -25,6 +25,7 @@ import org.apache.hadoop.classification.InterfaceStability.Unstable;
 import org.apache.hadoop.yarn.api.ApplicationClientProtocol;
 import org.apache.hadoop.yarn.util.Records;
 
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -91,14 +92,19 @@ public abstract class ApplicationReport {
       YarnApplicationState state, String diagnostics, String url,
       long startTime, long finishTime, FinalApplicationStatus finalStatus,
       ApplicationResourceUsageReport appResources, String origTrackingUrl,
-      float progress, String applicationType, Token amRmToken,
-      Set<String> tags) {
+      float progress, String applicationType, Token amRmToken, Set<String> tags,
+      boolean unmanagedApplication, Priority priority,
+      String appNodeLabelExpression, String amNodeLabelExpression) {
     ApplicationReport report =
         newInstance(applicationId, applicationAttemptId, user, queue, name,
           host, rpcPort, clientToAMToken, state, diagnostics, url, startTime,
           finishTime, finalStatus, appResources, origTrackingUrl, progress,
           applicationType, amRmToken);
     report.setApplicationTags(tags);
+    report.setUnmanagedApp(unmanagedApplication);
+    report.setPriority(priority);
+    report.setAppNodeLabelExpression(appNodeLabelExpression);
+    report.setAmNodeLabelExpression(amNodeLabelExpression);
     return report;
   }
 
@@ -393,4 +399,62 @@ public abstract class ApplicationReport {
   @Unstable
   public abstract void setLogAggregationStatus(
       LogAggregationStatus logAggregationStatus);
+
+  /**
+   * @return true if the AM is not managed by the RM
+   */
+  @Public
+  @Unstable
+  public abstract boolean isUnmanagedApp();
+
+  /**
+   * @param unmanagedApplication true if RM should not manage the AM
+   */
+  @Public
+  @Unstable
+  public abstract void setUnmanagedApp(boolean unmanagedApplication);
+
+  /**
+   * Get priority of the application
+   *
+   * @return Application's priority
+   */
+  @Public
+  @Stable
+  public abstract Priority getPriority();
+
+  @Private
+  @Unstable
+  public abstract void setPriority(Priority priority);
+
+  /**
+   * Get the default Node Label expression for all the application's containers
+   *
+   * @return Application's NodeLabelExpression
+   */
+  @Unstable
+  public abstract String getAppNodeLabelExpression();
+
+  @Unstable
+  public abstract void setAppNodeLabelExpression(String appNodeLabelExpression);
+
+  /**
+   * Get the default Node Label expression for all the application's containers
+   *
+   * @return Application's NodeLabelExpression
+   */
+  @Unstable
+  public abstract String getAmNodeLabelExpression();
+
+  @Unstable
+  public abstract void setAmNodeLabelExpression(String amNodeLabelExpression);
+
+  @Public
+  @Unstable
+  public abstract Map<ApplicationTimeoutType, ApplicationTimeout> getApplicationTimeouts();
+
+  @Private
+  @Unstable
+  public abstract void setApplicationTimeouts(
+      Map<ApplicationTimeoutType, ApplicationTimeout> timeouts);
 }

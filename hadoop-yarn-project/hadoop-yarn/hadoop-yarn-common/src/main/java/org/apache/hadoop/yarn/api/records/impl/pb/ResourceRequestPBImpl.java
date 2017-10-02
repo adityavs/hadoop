@@ -21,9 +21,12 @@ package org.apache.hadoop.yarn.api.records.impl.pb;
 
 import org.apache.hadoop.classification.InterfaceAudience.Private;
 import org.apache.hadoop.classification.InterfaceStability.Unstable;
+import org.apache.hadoop.yarn.api.records.ExecutionTypeRequest;
 import org.apache.hadoop.yarn.api.records.Priority;
+import org.apache.hadoop.yarn.api.records.ProfileCapability;
 import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.api.records.ResourceRequest;
+import org.apache.hadoop.yarn.proto.YarnProtos.ProfileCapabilityProto;
 import org.apache.hadoop.yarn.proto.YarnProtos.PriorityProto;
 import org.apache.hadoop.yarn.proto.YarnProtos.ResourceProto;
 import org.apache.hadoop.yarn.proto.YarnProtos.ResourceRequestProto;
@@ -38,6 +41,8 @@ public class ResourceRequestPBImpl extends  ResourceRequest {
   
   private Priority priority = null;
   private Resource capability = null;
+  private ExecutionTypeRequest executionTypeRequest = null;
+  private ProfileCapability profile = null;
   
   
   public ResourceRequestPBImpl() {
@@ -50,7 +55,7 @@ public class ResourceRequestPBImpl extends  ResourceRequest {
   }
   
   public ResourceRequestProto getProto() {
-      mergeLocalToProto();
+    mergeLocalToProto();
     proto = viaProto ? proto : builder.build();
     viaProto = true;
     return proto;
@@ -62,6 +67,13 @@ public class ResourceRequestPBImpl extends  ResourceRequest {
     }
     if (this.capability != null) {
       builder.setCapability(convertToProtoFormat(this.capability));
+    }
+    if (this.executionTypeRequest != null) {
+      builder.setExecutionTypeRequest(
+          ProtoUtils.convertToProtoFormat(this.executionTypeRequest));
+    }
+    if (this.profile != null) {
+      builder.setProfile(converToProtoFormat(this.profile));
     }
   }
 
@@ -101,6 +113,29 @@ public class ResourceRequestPBImpl extends  ResourceRequest {
       builder.clearPriority();
     this.priority = priority;
   }
+
+
+  public ExecutionTypeRequest getExecutionTypeRequest() {
+    ResourceRequestProtoOrBuilder p = viaProto ? proto : builder;
+    if (this.executionTypeRequest != null) {
+      return this.executionTypeRequest;
+    }
+    if (!p.hasExecutionTypeRequest()) {
+      return null;
+    }
+    this.executionTypeRequest =
+        ProtoUtils.convertFromProtoFormat(p.getExecutionTypeRequest());
+    return this.executionTypeRequest;
+  }
+
+  public void setExecutionTypeRequest(ExecutionTypeRequest execSpec) {
+    maybeInitBuilder();
+    if (execSpec == null) {
+      builder.clearExecutionTypeRequest();
+    }
+    this.executionTypeRequest = execSpec;
+  }
+
   @Override
   public String getResourceName() {
     ResourceRequestProtoOrBuilder p = viaProto ? proto : builder;
@@ -163,6 +198,18 @@ public class ResourceRequestPBImpl extends  ResourceRequest {
     builder.setRelaxLocality(relaxLocality);
   }
 
+  @Override
+  public long getAllocationRequestId() {
+    ResourceRequestProtoOrBuilder p = viaProto ? proto : builder;
+    return (p.getAllocationRequestId());
+  }
+
+  @Override
+  public void setAllocationRequestId(long allocationRequestID) {
+    maybeInitBuilder();
+    builder.setAllocationRequestId(allocationRequestID);
+  }
+
   private PriorityPBImpl convertFromProtoFormat(PriorityProto p) {
     return new PriorityPBImpl(p);
   }
@@ -176,16 +223,20 @@ public class ResourceRequestPBImpl extends  ResourceRequest {
   }
 
   private ResourceProto convertToProtoFormat(Resource t) {
-    return ((ResourcePBImpl)t).getProto();
+    return ProtoUtils.convertToProtoFormat(t);
   }
   
   @Override
   public String toString() {
-    return "{Priority: " + getPriority() + ", Capability: " + getCapability()
+    return "{AllocationRequestId: " + getAllocationRequestId()
+        + ", Priority: " + getPriority()
+        + ", Capability: " + getCapability()
         + ", # Containers: " + getNumContainers()
         + ", Location: " + getResourceName()
         + ", Relax Locality: " + getRelaxLocality()
-        + ", Node Label Expression: " + getNodeLabelExpression() + "}";
+        + ", Execution Type Request: " + getExecutionTypeRequest()
+        + ", Node Label Expression: " + getNodeLabelExpression()
+        + ", Resource Profile: " + getProfileCapability() + "}";
   }
 
   @Override
@@ -205,5 +256,35 @@ public class ResourceRequestPBImpl extends  ResourceRequest {
       return;
     }
     builder.setNodeLabelExpression(nodeLabelExpression);
+  }
+
+  @Override
+  public void setProfileCapability(ProfileCapability profileCapability) {
+    maybeInitBuilder();
+    if (profile == null) {
+      builder.clearProfile();
+    }
+    this.profile = profileCapability;
+  }
+
+  @Override
+  public ProfileCapability getProfileCapability() {
+    if (profile != null) {
+      return profile;
+    }
+    ResourceRequestProtoOrBuilder p = viaProto ? proto : builder;
+    if (!p.hasProfile()) {
+      return null;
+    }
+    return new ProfileCapabilityPBImpl(p.getProfile());
+  }
+
+  private ProfileCapabilityProto converToProtoFormat(
+      ProfileCapability profileCapability) {
+    ProfileCapabilityPBImpl tmp = new ProfileCapabilityPBImpl();
+    tmp.setProfileName(profileCapability.getProfileName());
+    tmp.setProfileCapabilityOverride(
+        profileCapability.getProfileCapabilityOverride());
+    return tmp.getProto();
   }
 }

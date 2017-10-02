@@ -23,9 +23,9 @@ import static org.apache.hadoop.yarn.util.StringHelper.pajoin;
 import java.net.InetSocketAddress;
 
 import org.apache.hadoop.ha.HAServiceProtocol.HAServiceState;
-import org.apache.hadoop.yarn.api.ApplicationBaseProtocol;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.util.RMHAUtils;
+import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
 import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
 import org.apache.hadoop.yarn.webapp.GenericExceptionHandler;
 import org.apache.hadoop.yarn.webapp.WebApp;
@@ -54,7 +54,6 @@ public class RMWebApp extends WebApp implements YarnWebParams {
 
     if (rm != null) {
       bind(ResourceManager.class).toInstance(rm);
-      bind(ApplicationBaseProtocol.class).toInstance(rm.getClientRMService());
     }
     route("/", RmController.class);
     route(pajoin("/nodes", NODE_STATE), RmController.class, "nodes");
@@ -70,6 +69,7 @@ public class RMWebApp extends WebApp implements YarnWebParams {
     route("/errors-and-warnings", RmController.class, "errorsAndWarnings");
     route(pajoin("/logaggregationstatus", APPLICATION_ID),
       RmController.class, "logaggregationstatus");
+    route(pajoin("/failure", APPLICATION_ID), RmController.class, "failure");
   }
 
   @Override
@@ -116,5 +116,13 @@ public class RMWebApp extends WebApp implements YarnWebParams {
           : "http://" + path;
     }
     return path;
+  }
+
+  public String getHAZookeeperConnectionState() {
+    return getRMContext().getHAZookeeperConnectionState();
+  }
+
+  public RMContext getRMContext() {
+    return rm.getRMContext();
   }
 }

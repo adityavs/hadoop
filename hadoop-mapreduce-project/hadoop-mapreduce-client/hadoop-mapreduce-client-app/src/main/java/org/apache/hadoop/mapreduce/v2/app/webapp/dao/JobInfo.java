@@ -51,6 +51,7 @@ public class JobInfo {
   protected String id;
   protected String name;
   protected String user;
+  protected String queue;
   protected JobState state;
   protected int mapsTotal;
   protected int mapsCompleted;
@@ -97,17 +98,18 @@ public class JobInfo {
     }
     this.name = job.getName().toString();
     this.user = job.getUserName();
+    this.queue = job.getQueueName();
     this.state = job.getState();
     this.mapsTotal = job.getTotalMaps();
     this.mapsCompleted = job.getCompletedMaps();
     this.mapProgress = report.getMapProgress() * 100;
     this.mapProgressPercent =
-        StringUtils.formatPercent(report.getMapProgress(), 2);
+        StringUtils.format("%.2f", getMapProgress());
     this.reducesTotal = job.getTotalReduces();
     this.reducesCompleted = job.getCompletedReduces();
     this.reduceProgress = report.getReduceProgress() * 100;
     this.reduceProgressPercent =
-        StringUtils.formatPercent(report.getReduceProgress(), 2);
+        StringUtils.format("%.2f", getReduceProgress());
 
     this.acls = new ArrayList<ConfEntryInfo>();
     if (hasAccess) {
@@ -221,6 +223,10 @@ public class JobInfo {
 
   public String getName() {
     return this.name;
+  }
+
+  public String getQueueName() {
+    return this.queue;
   }
 
   public String getId() {

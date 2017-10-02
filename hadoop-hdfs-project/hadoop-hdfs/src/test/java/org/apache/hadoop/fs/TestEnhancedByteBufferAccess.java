@@ -34,11 +34,12 @@ import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.TimeoutException;
 
+import org.apache.commons.collections.map.LinkedMap;
 import org.apache.commons.lang.SystemUtils;
 import org.apache.commons.lang.mutable.MutableBoolean;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.apache.hadoop.hdfs.BlockReaderTestUtil;
+import org.apache.hadoop.hdfs.client.impl.BlockReaderTestUtil;
 import org.apache.hadoop.hdfs.ClientContext;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.DFSTestUtil;
@@ -48,7 +49,6 @@ import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
 import org.apache.hadoop.hdfs.client.HdfsClientConfigKeys;
 import org.apache.hadoop.hdfs.client.HdfsDataInputStream;
-import org.apache.hadoop.hdfs.client.impl.DfsClientConf;
 import org.apache.hadoop.hdfs.protocol.CacheDirectiveInfo;
 import org.apache.hadoop.hdfs.protocol.CachePoolInfo;
 import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
@@ -308,8 +308,8 @@ public class TestEnhancedByteBufferAccess {
     public void visit(int numOutstandingMmaps,
         Map<ExtendedBlockId, ShortCircuitReplica> replicas,
         Map<ExtendedBlockId, InvalidToken> failedLoads,
-        Map<Long, ShortCircuitReplica> evictable,
-        Map<Long, ShortCircuitReplica> evictableMmapped) {
+        LinkedMap evictable,
+        LinkedMap evictableMmapped) {
       if (expectedNumOutstandingMmaps >= 0) {
         Assert.assertEquals(expectedNumOutstandingMmaps, numOutstandingMmaps);
       }
@@ -337,7 +337,7 @@ public class TestEnhancedByteBufferAccess {
     ByteBuffer results[] = { null, null, null, null };
 
     DistributedFileSystem fs = null;
-    conf.set(DFSConfigKeys.DFS_CLIENT_CONTEXT, CONTEXT);
+    conf.set(HdfsClientConfigKeys.DFS_CLIENT_CONTEXT, CONTEXT);
     cluster = new MiniDFSCluster.Builder(conf).numDataNodes(1).build();
     cluster.waitActive();
     fs = cluster.getFileSystem();
@@ -358,7 +358,7 @@ public class TestEnhancedByteBufferAccess {
     fsIn.close();
     fsIn = fs.open(TEST_PATH);
     final ShortCircuitCache cache = ClientContext.get(
-        CONTEXT, new DfsClientConf(conf)). getShortCircuitCache();
+        CONTEXT, conf).getShortCircuitCache();
     cache.accept(new CountingVisitor(0, 5, 5, 0));
     results[0] = fsIn.read(null, BLOCK_SIZE,
         EnumSet.of(ReadOption.SKIP_CHECKSUMS));
@@ -374,8 +374,8 @@ public class TestEnhancedByteBufferAccess {
       public void visit(int numOutstandingMmaps,
           Map<ExtendedBlockId, ShortCircuitReplica> replicas,
           Map<ExtendedBlockId, InvalidToken> failedLoads, 
-          Map<Long, ShortCircuitReplica> evictable,
-          Map<Long, ShortCircuitReplica> evictableMmapped) {
+          LinkedMap evictable,
+          LinkedMap evictableMmapped) {
         ShortCircuitReplica replica = replicas.get(
             new ExtendedBlockId(firstBlock.getBlockId(), firstBlock.getBlockPoolId()));
         Assert.assertNotNull(replica);
@@ -411,8 +411,8 @@ public class TestEnhancedByteBufferAccess {
           public void visit(int numOutstandingMmaps,
               Map<ExtendedBlockId, ShortCircuitReplica> replicas,
               Map<ExtendedBlockId, InvalidToken> failedLoads,
-              Map<Long, ShortCircuitReplica> evictable,
-              Map<Long, ShortCircuitReplica> evictableMmapped) {
+              LinkedMap evictable,
+              LinkedMap evictableMmapped) {
             finished.setValue(evictableMmapped.isEmpty());
           }
         });
@@ -558,27 +558,25 @@ public class TestEnhancedByteBufferAccess {
    */
   @Test
   public void testIndirectFallbackReads() throws Exception {
-    final File TEST_DIR = new File(
-      System.getProperty("test.build.data","build/test/data"));
-    final String TEST_PATH = TEST_DIR + File.separator +
-        "indirectFallbackTestFile";
+    final String testPath = GenericTestUtils
+        .getTestDir("indirectFallbackTestFile").getAbsolutePath();
     final int TEST_FILE_LENGTH = 16385;
     final int RANDOM_SEED = 23453;
     FileOutputStream fos = null;
     FileInputStream fis = null;
     try {
-      fos = new FileOutputStream(TEST_PATH);
+      fos = new FileOutputStream(testPath);
       Random random = new Random(RANDOM_SEED);
       byte original[] = new byte[TEST_FILE_LENGTH];
       random.nextBytes(original);
       fos.write(original);
       fos.close();
       fos = null;
-      fis = new FileInputStream(TEST_PATH);
+      fis = new FileInputStream(testPath);
       testFallbackImpl(fis, original);
     } finally {
       IOUtils.cleanup(LOG, fos, fis);
-      new File(TEST_PATH).delete();
+      new File(testPath).delete();
     }
   }
 
@@ -599,7 +597,7 @@ public class TestEnhancedByteBufferAccess {
     conf.setBoolean(HdfsClientConfigKeys.Read.ShortCircuit.SKIP_CHECKSUM_KEY,
         false);
     final String CONTEXT = "testZeroCopyReadOfCachedData";
-    conf.set(DFSConfigKeys.DFS_CLIENT_CONTEXT, CONTEXT);
+    conf.set(HdfsClientConfigKeys.DFS_CLIENT_CONTEXT, CONTEXT);
     conf.setLong(DFS_DATANODE_MAX_LOCKED_MEMORY_KEY,
         DFSTestUtil.roundUpToMultiple(TEST_FILE_LENGTH,
           (int) NativeIO.POSIX.getCacheManipulator().getOperatingSystemPageSize()));
@@ -661,7 +659,7 @@ public class TestEnhancedByteBufferAccess {
     final ExtendedBlock firstBlock =
         DFSTestUtil.getFirstBlock(fs, TEST_PATH);
     final ShortCircuitCache cache = ClientContext.get(
-        CONTEXT, new DfsClientConf(conf)). getShortCircuitCache();
+        CONTEXT, conf).getShortCircuitCache();
     waitForReplicaAnchorStatus(cache, firstBlock, true, true, 1);
     // Uncache the replica
     fs.removeCacheDirective(directiveId);
@@ -688,8 +686,8 @@ public class TestEnhancedByteBufferAccess {
           public void visit(int numOutstandingMmaps,
               Map<ExtendedBlockId, ShortCircuitReplica> replicas,
               Map<ExtendedBlockId, InvalidToken> failedLoads,
-              Map<Long, ShortCircuitReplica> evictable,
-              Map<Long, ShortCircuitReplica> evictableMmapped) {
+              LinkedMap evictable,
+              LinkedMap evictableMmapped) {
             Assert.assertEquals(expectedOutstandingMmaps, numOutstandingMmaps);
             ShortCircuitReplica replica =
                 replicas.get(ExtendedBlockId.fromExtendedBlock(block));
@@ -722,7 +720,7 @@ public class TestEnhancedByteBufferAccess {
     final String CONTEXT = "testClientMmapDisable";
     FSDataInputStream fsIn = null;
     DistributedFileSystem fs = null;
-    conf.set(DFSConfigKeys.DFS_CLIENT_CONTEXT, CONTEXT);
+    conf.set(HdfsClientConfigKeys.DFS_CLIENT_CONTEXT, CONTEXT);
 
     try {
       // With HdfsClientConfigKeys.Mmap.ENABLED_KEY set to false,
@@ -753,7 +751,7 @@ public class TestEnhancedByteBufferAccess {
       // Now try again with HdfsClientConfigKeys.Mmap.CACHE_SIZE_KEY == 0.
       conf.setBoolean(HdfsClientConfigKeys.Mmap.ENABLED_KEY, true);
       conf.setInt(HdfsClientConfigKeys.Mmap.CACHE_SIZE_KEY, 0);
-      conf.set(DFSConfigKeys.DFS_CLIENT_CONTEXT, CONTEXT + ".1");
+      conf.set(HdfsClientConfigKeys.DFS_CLIENT_CONTEXT, CONTEXT + ".1");
       cluster = new MiniDFSCluster.Builder(conf).numDataNodes(1).build();
       cluster.waitActive();
       fs = cluster.getFileSystem();
@@ -784,7 +782,7 @@ public class TestEnhancedByteBufferAccess {
     MiniDFSCluster cluster = null;
     final Path TEST_PATH = new Path("/a");
     final String CONTEXT = "test2GBMmapLimit";
-    conf.set(DFSConfigKeys.DFS_CLIENT_CONTEXT, CONTEXT);
+    conf.set(HdfsClientConfigKeys.DFS_CLIENT_CONTEXT, CONTEXT);
 
     FSDataInputStream fsIn = null, fsIn2 = null;
     ByteBuffer buf1 = null, buf2 = null;

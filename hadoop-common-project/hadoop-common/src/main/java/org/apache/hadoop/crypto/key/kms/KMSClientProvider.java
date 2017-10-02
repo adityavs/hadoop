@@ -18,7 +18,6 @@
 package org.apache.hadoop.crypto.key.kms;
 
 import org.apache.commons.codec.binary.Base64;
-import org.apache.commons.io.Charsets;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.crypto.key.KeyProvider;
@@ -27,20 +26,24 @@ import org.apache.hadoop.crypto.key.KeyProviderDelegationTokenExtension;
 import org.apache.hadoop.crypto.key.KeyProviderFactory;
 import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.security.Credentials;
 import org.apache.hadoop.security.ProviderUtils;
 import org.apache.hadoop.security.SecurityUtil;
 import org.apache.hadoop.security.UserGroupInformation;
-import org.apache.hadoop.security.authentication.client.AuthenticatedURL;
-import org.apache.hadoop.security.authentication.client.AuthenticationException;
 import org.apache.hadoop.security.authentication.client.ConnectionConfigurator;
 import org.apache.hadoop.security.ssl.SSLFactory;
 import org.apache.hadoop.security.token.Token;
+import org.apache.hadoop.security.token.TokenIdentifier;
+import org.apache.hadoop.security.token.TokenRenewer;
+import org.apache.hadoop.security.token.delegation.AbstractDelegationTokenIdentifier;
 import org.apache.hadoop.security.token.delegation.web.DelegationTokenAuthenticatedURL;
 import org.apache.hadoop.util.HttpExceptionUtils;
+import org.apache.hadoop.util.KMSUtil;
 import org.apache.http.client.utils.URIBuilder;
-import org.codehaus.jackson.map.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.net.ssl.HttpsURLConnection;
 
@@ -58,13 +61,13 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.NoSuchAlgorithmException;
 import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
@@ -73,9 +76,18 @@ import java.util.concurrent.ExecutionException;
 import org.apache.hadoop.crypto.key.KeyProviderCryptoExtension;
 import org.apache.hadoop.crypto.key.KeyProviderCryptoExtension.CryptoExtension;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.ObjectWriter;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
+
+import static org.apache.hadoop.util.KMSUtil.checkNotEmpty;
+import static org.apache.hadoop.util.KMSUtil.checkNotNull;
+import static org.apache.hadoop.util.KMSUtil.parseJSONEncKeyVersion;
+import static org.apache.hadoop.util.KMSUtil.parseJSONEncKeyVersions;
+import static org.apache.hadoop.util.KMSUtil.parseJSONKeyVersion;
+import static org.apache.hadoop.util.KMSUtil.parseJSONMetadata;
 
 /**
  * KMS client <code>KeyProvider</code> implementation.
@@ -84,11 +96,15 @@ import com.google.common.base.Strings;
 public class KMSClientProvider extends KeyProvider implements CryptoExtension,
     KeyProviderDelegationTokenExtension.DelegationTokenExtension {
 
+  private static final Logger LOG =
+      LoggerFactory.getLogger(KMSClientProvider.class);
+
   private static final String INVALID_SIGNATURE = "Invalid signature";
 
   private static final String ANONYMOUS_REQUESTS_DISALLOWED = "Anonymous requests are disallowed";
 
-  public static final String TOKEN_KIND = "kms-dt";
+  public static final String TOKEN_KIND_STR = KMSDelegationToken.TOKEN_KIND_STR;
+  public static final Text TOKEN_KIND = KMSDelegationToken.TOKEN_KIND;
 
   public static final String SCHEME_NAME = "kms";
 
@@ -118,6 +134,9 @@ public class KMSClientProvider extends KeyProvider implements CryptoExtension,
 
   private final ValueQueue<EncryptedKeyVersion> encKeyVersionQueue;
 
+  private static final ObjectWriter WRITER =
+      new ObjectMapper().writerWithDefaultPrettyPrinter();
+
   private class EncryptedQueueRefiller implements
     ValueQueue.QueueRefiller<EncryptedKeyVersion> {
 
@@ -135,8 +154,68 @@ public class KMSClientProvider extends KeyProvider implements CryptoExtension,
       List response = call(conn, null,
           HttpURLConnection.HTTP_OK, List.class);
       List<EncryptedKeyVersion> ekvs =
-          parseJSONEncKeyVersion(keyName, response);
+          parseJSONEncKeyVersions(keyName, response);
       keyQueue.addAll(ekvs);
+    }
+  }
+
+  /**
+   * The KMS implementation of {@link TokenRenewer}.
+   */
+  public static class KMSTokenRenewer extends TokenRenewer {
+    private static final Logger LOG =
+        LoggerFactory.getLogger(KMSTokenRenewer.class);
+
+    @Override
+    public boolean handleKind(Text kind) {
+      return kind.equals(TOKEN_KIND);
+    }
+
+    @Override
+    public boolean isManaged(Token<?> token) throws IOException {
+      return true;
+    }
+
+    @Override
+    public long renew(Token<?> token, Configuration conf) throws IOException {
+      LOG.debug("Renewing delegation token {}", token);
+      KeyProvider keyProvider = KMSUtil.createKeyProvider(conf,
+          KeyProviderFactory.KEY_PROVIDER_PATH);
+      try {
+        if (!(keyProvider instanceof
+            KeyProviderDelegationTokenExtension.DelegationTokenExtension)) {
+          LOG.warn("keyProvider {} cannot renew dt.", keyProvider == null ?
+              "null" : keyProvider.getClass());
+          return 0;
+        }
+        return ((KeyProviderDelegationTokenExtension.DelegationTokenExtension)
+            keyProvider).renewDelegationToken(token);
+      } finally {
+        if (keyProvider != null) {
+          keyProvider.close();
+        }
+      }
+    }
+
+    @Override
+    public void cancel(Token<?> token, Configuration conf) throws IOException {
+      LOG.debug("Canceling delegation token {}", token);
+      KeyProvider keyProvider = KMSUtil.createKeyProvider(conf,
+          KeyProviderFactory.KEY_PROVIDER_PATH);
+      try {
+        if (!(keyProvider instanceof
+            KeyProviderDelegationTokenExtension.DelegationTokenExtension)) {
+          LOG.warn("keyProvider {} cannot cancel dt.", keyProvider == null ?
+              "null" : keyProvider.getClass());
+          return;
+        }
+        ((KeyProviderDelegationTokenExtension.DelegationTokenExtension)
+            keyProvider).cancelDelegationToken(token);
+      } finally {
+        if (keyProvider != null) {
+          keyProvider.close();
+        }
+      }
     }
   }
 
@@ -148,73 +227,10 @@ public class KMSClientProvider extends KeyProvider implements CryptoExtension,
     }
   }
 
-  @SuppressWarnings("rawtypes")
-  private static List<EncryptedKeyVersion>
-      parseJSONEncKeyVersion(String keyName, List valueList) {
-    List<EncryptedKeyVersion> ekvs = new LinkedList<EncryptedKeyVersion>();
-    if (!valueList.isEmpty()) {
-      for (Object values : valueList) {
-        Map valueMap = (Map) values;
-
-        String versionName = checkNotNull(
-                (String) valueMap.get(KMSRESTConstants.VERSION_NAME_FIELD),
-                KMSRESTConstants.VERSION_NAME_FIELD);
-
-        byte[] iv = Base64.decodeBase64(checkNotNull(
-                (String) valueMap.get(KMSRESTConstants.IV_FIELD),
-                KMSRESTConstants.IV_FIELD));
-
-        Map encValueMap = checkNotNull((Map)
-                valueMap.get(KMSRESTConstants.ENCRYPTED_KEY_VERSION_FIELD),
-                KMSRESTConstants.ENCRYPTED_KEY_VERSION_FIELD);
-
-        String encVersionName = checkNotNull((String)
-                encValueMap.get(KMSRESTConstants.VERSION_NAME_FIELD),
-                KMSRESTConstants.VERSION_NAME_FIELD);
-
-        byte[] encKeyMaterial = Base64.decodeBase64(checkNotNull((String)
-                encValueMap.get(KMSRESTConstants.MATERIAL_FIELD),
-                KMSRESTConstants.MATERIAL_FIELD));
-
-        ekvs.add(new KMSEncryptedKeyVersion(keyName, versionName, iv,
-            encVersionName, encKeyMaterial));
-      }
-    }
-    return ekvs;
-  }
-
-  private static KeyVersion parseJSONKeyVersion(Map valueMap) {
-    KeyVersion keyVersion = null;
-    if (!valueMap.isEmpty()) {
-      byte[] material = (valueMap.containsKey(KMSRESTConstants.MATERIAL_FIELD))
-          ? Base64.decodeBase64((String) valueMap.get(KMSRESTConstants.MATERIAL_FIELD))
-          : null;
-      String versionName = (String)valueMap.get(KMSRESTConstants.VERSION_NAME_FIELD);
-      String keyName = (String)valueMap.get(KMSRESTConstants.NAME_FIELD);
-      keyVersion = new KMSKeyVersion(keyName, versionName, material);
-    }
-    return keyVersion;
-  }
-
-  @SuppressWarnings("unchecked")
-  private static Metadata parseJSONMetadata(Map valueMap) {
-    Metadata metadata = null;
-    if (!valueMap.isEmpty()) {
-      metadata = new KMSMetadata(
-          (String) valueMap.get(KMSRESTConstants.CIPHER_FIELD),
-          (Integer) valueMap.get(KMSRESTConstants.LENGTH_FIELD),
-          (String) valueMap.get(KMSRESTConstants.DESCRIPTION_FIELD),
-          (Map<String, String>) valueMap.get(KMSRESTConstants.ATTRIBUTES_FIELD),
-          new Date((Long) valueMap.get(KMSRESTConstants.CREATED_FIELD)),
-          (Integer) valueMap.get(KMSRESTConstants.VERSIONS_FIELD));
-    }
-    return metadata;
-  }
-
-  private static void writeJson(Map map, OutputStream os) throws IOException {
-    Writer writer = new OutputStreamWriter(os, Charsets.UTF_8);
-    ObjectMapper jsonMapper = new ObjectMapper();
-    jsonMapper.writerWithDefaultPrettyPrinter().writeValue(writer, map);
+  private static void writeJson(Object obj, OutputStream os)
+      throws IOException {
+    Writer writer = new OutputStreamWriter(os, StandardCharsets.UTF_8);
+    WRITER.writeValue(writer, obj);
   }
 
   /**
@@ -290,31 +306,11 @@ public class KMSClientProvider extends KeyProvider implements CryptoExtension,
     }
   }
 
-  public static <T> T checkNotNull(T o, String name)
-      throws IllegalArgumentException {
-    if (o == null) {
-      throw new IllegalArgumentException("Parameter '" + name +
-          "' cannot be null");
-    }
-    return o;
-  }
-
-  public static String checkNotEmpty(String s, String name)
-      throws IllegalArgumentException {
-    checkNotNull(s, name);
-    if (s.isEmpty()) {
-      throw new IllegalArgumentException("Parameter '" + name +
-          "' cannot be empty");
-    }
-    return s;
-  }
-
   private String kmsUrl;
   private SSLFactory sslFactory;
   private ConnectionConfigurator configurator;
   private DelegationTokenAuthenticatedURL.Token authToken;
   private final int authRetry;
-  private final UserGroupInformation actualUgi;
 
   @Override
   public String toString() {
@@ -396,11 +392,6 @@ public class KMSClientProvider extends KeyProvider implements CryptoExtension,
                     KMS_CLIENT_ENC_KEY_CACHE_NUM_REFILL_THREADS_DEFAULT),
             new EncryptedQueueRefiller());
     authToken = new DelegationTokenAuthenticatedURL.Token();
-    actualUgi =
-        (UserGroupInformation.getCurrentUser().getAuthenticationMethod() ==
-        UserGroupInformation.AuthenticationMethod.PROXY) ? UserGroupInformation
-            .getCurrentUser().getRealUser() : UserGroupInformation
-            .getCurrentUser();
   }
 
   private static Path extractKMSPath(URI uri) throws MalformedURLException, IOException {
@@ -467,15 +458,9 @@ public class KMSClientProvider extends KeyProvider implements CryptoExtension,
       throws IOException {
     HttpURLConnection conn;
     try {
-      // if current UGI is different from UGI at constructor time, behave as
-      // proxyuser
-      UserGroupInformation currentUgi = UserGroupInformation.getCurrentUser();
-      final String doAsUser = (currentUgi.getAuthenticationMethod() ==
-          UserGroupInformation.AuthenticationMethod.PROXY)
-                              ? currentUgi.getShortUserName() : null;
-
-      // creating the HTTP connection using the current UGI at constructor time
-      conn = actualUgi.doAs(new PrivilegedExceptionAction<HttpURLConnection>() {
+      final String doAsUser = getDoAsUser();
+      conn = getActualUgi().doAs(new PrivilegedExceptionAction
+          <HttpURLConnection>() {
         @Override
         public HttpURLConnection run() throws Exception {
           DelegationTokenAuthenticatedURL authUrl =
@@ -484,6 +469,9 @@ public class KMSClientProvider extends KeyProvider implements CryptoExtension,
         }
       });
     } catch (IOException ex) {
+      if (ex instanceof SocketTimeoutException) {
+        LOG.warn("Failed to connect to {}:{}", url.getHost(), url.getPort());
+      }
       throw ex;
     } catch (UndeclaredThrowableException ex) {
       throw new IOException(ex.getUndeclaredThrowable());
@@ -499,12 +487,12 @@ public class KMSClientProvider extends KeyProvider implements CryptoExtension,
     return conn;
   }
 
-  private <T> T call(HttpURLConnection conn, Map jsonOutput,
+  private <T> T call(HttpURLConnection conn, Object jsonOutput,
       int expectedResponse, Class<T> klass) throws IOException {
     return call(conn, jsonOutput, expectedResponse, klass, authRetry);
   }
 
-  private <T> T call(HttpURLConnection conn, Map jsonOutput,
+  private <T> T call(HttpURLConnection conn, Object jsonOutput,
       int expectedResponse, Class<T> klass, int authRetryCount)
       throws IOException {
     T ret = null;
@@ -513,7 +501,7 @@ public class KMSClientProvider extends KeyProvider implements CryptoExtension,
         writeJson(jsonOutput, conn.getOutputStream());
       }
     } catch (IOException ex) {
-      conn.getInputStream().close();
+      IOUtils.closeStream(conn.getInputStream());
       throw ex;
     }
     if ((conn.getResponseCode() == HttpURLConnection.HTTP_FORBIDDEN
@@ -524,6 +512,10 @@ public class KMSClientProvider extends KeyProvider implements CryptoExtension,
       // failure. Unfortunately, the AuthenticationFilter returns 403 when it
       // cannot authenticate (Since a 401 requires Server to send
       // WWW-Authenticate header as well)..
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Response={}({}), resetting authToken",
+            conn.getResponseCode(), conn.getResponseMessage());
+      }
       KMSClientProvider.this.authToken =
           new DelegationTokenAuthenticatedURL.Token();
       if (authRetryCount > 0) {
@@ -536,30 +528,18 @@ public class KMSClientProvider extends KeyProvider implements CryptoExtension,
             authRetryCount - 1);
       }
     }
-    try {
-      AuthenticatedURL.extractToken(conn, authToken);
-    } catch (AuthenticationException e) {
-      // Ignore the AuthExceptions.. since we are just using the method to
-      // extract and set the authToken.. (Workaround till we actually fix
-      // AuthenticatedURL properly to set authToken post initialization)
-    }
     HttpExceptionUtils.validateResponse(conn, expectedResponse);
-    if (APPLICATION_JSON_MIME.equalsIgnoreCase(conn.getContentType())
+    if (conn.getContentType() != null
+        && conn.getContentType().trim().toLowerCase()
+            .startsWith(APPLICATION_JSON_MIME)
         && klass != null) {
       ObjectMapper mapper = new ObjectMapper();
       InputStream is = null;
       try {
         is = conn.getInputStream();
         ret = mapper.readValue(is, klass);
-      } catch (IOException ex) {
-        if (is != null) {
-          is.close();
-        }
-        throw ex;
       } finally {
-        if (is != null) {
-          is.close();
-        }
+        IOUtils.closeStream(is);
       }
     }
     return ret;
@@ -696,6 +676,17 @@ public class KMSClientProvider extends KeyProvider implements CryptoExtension,
     }
   }
 
+  @Override
+  public void invalidateCache(String name) throws IOException {
+    checkNotEmpty(name, "name");
+    final URL url = createURL(KMSRESTConstants.KEY_RESOURCE, name,
+        KMSRESTConstants.INVALIDATECACHE_RESOURCE, null);
+    final HttpURLConnection conn = createConnection(url, HTTP_POST);
+    // invalidate the server cache first, then drain local cache.
+    call(conn, null, HttpURLConnection.HTTP_OK, null);
+    drain(name);
+  }
+
   private KeyVersion rollNewVersionInternal(String name, byte[] material)
       throws NoSuchAlgorithmException, IOException {
     checkNotEmpty(name, "name");
@@ -710,7 +701,7 @@ public class KMSClientProvider extends KeyProvider implements CryptoExtension,
     Map response = call(conn, jsonMaterial,
         HttpURLConnection.HTTP_OK, Map.class);
     KeyVersion keyVersion = parseJSONKeyVersion(response);
-    encKeyVersionQueue.drain(name);
+    invalidateCache(name);
     return keyVersion;
   }
 
@@ -781,6 +772,77 @@ public class KMSClientProvider extends KeyProvider implements CryptoExtension,
   }
 
   @Override
+  public EncryptedKeyVersion reencryptEncryptedKey(EncryptedKeyVersion ekv)
+      throws IOException, GeneralSecurityException {
+    checkNotNull(ekv.getEncryptionKeyVersionName(), "versionName");
+    checkNotNull(ekv.getEncryptedKeyIv(), "iv");
+    checkNotNull(ekv.getEncryptedKeyVersion(), "encryptedKey");
+    Preconditions.checkArgument(ekv.getEncryptedKeyVersion().getVersionName()
+            .equals(KeyProviderCryptoExtension.EEK),
+        "encryptedKey version name must be '%s', is '%s'",
+        KeyProviderCryptoExtension.EEK,
+        ekv.getEncryptedKeyVersion().getVersionName());
+    final Map<String, String> params = new HashMap<>();
+    params.put(KMSRESTConstants.EEK_OP, KMSRESTConstants.EEK_REENCRYPT);
+    final Map<String, Object> jsonPayload = new HashMap<>();
+    jsonPayload.put(KMSRESTConstants.NAME_FIELD, ekv.getEncryptionKeyName());
+    jsonPayload.put(KMSRESTConstants.IV_FIELD,
+        Base64.encodeBase64String(ekv.getEncryptedKeyIv()));
+    jsonPayload.put(KMSRESTConstants.MATERIAL_FIELD,
+        Base64.encodeBase64String(ekv.getEncryptedKeyVersion().getMaterial()));
+    final URL url = createURL(KMSRESTConstants.KEY_VERSION_RESOURCE,
+        ekv.getEncryptionKeyVersionName(), KMSRESTConstants.EEK_SUB_RESOURCE,
+        params);
+    final HttpURLConnection conn = createConnection(url, HTTP_POST);
+    conn.setRequestProperty(CONTENT_TYPE, APPLICATION_JSON_MIME);
+    final Map response =
+        call(conn, jsonPayload, HttpURLConnection.HTTP_OK, Map.class);
+    return parseJSONEncKeyVersion(ekv.getEncryptionKeyName(), response);
+  }
+
+  @Override
+  public void reencryptEncryptedKeys(List<EncryptedKeyVersion> ekvs)
+      throws IOException, GeneralSecurityException {
+    checkNotNull(ekvs, "ekvs");
+    if (ekvs.isEmpty()) {
+      return;
+    }
+    final List<Map> jsonPayload = new ArrayList<>();
+    String keyName = null;
+    for (EncryptedKeyVersion ekv : ekvs) {
+      checkNotNull(ekv.getEncryptionKeyName(), "keyName");
+      checkNotNull(ekv.getEncryptionKeyVersionName(), "versionName");
+      checkNotNull(ekv.getEncryptedKeyIv(), "iv");
+      checkNotNull(ekv.getEncryptedKeyVersion(), "encryptedKey");
+      Preconditions.checkArgument(ekv.getEncryptedKeyVersion().getVersionName()
+              .equals(KeyProviderCryptoExtension.EEK),
+          "encryptedKey version name must be '%s', is '%s'",
+          KeyProviderCryptoExtension.EEK,
+          ekv.getEncryptedKeyVersion().getVersionName());
+      if (keyName == null) {
+        keyName = ekv.getEncryptionKeyName();
+      } else {
+        Preconditions.checkArgument(keyName.equals(ekv.getEncryptionKeyName()),
+            "All EncryptedKey must have the same key name.");
+      }
+      jsonPayload.add(KMSUtil.toJSON(ekv));
+    }
+    final URL url = createURL(KMSRESTConstants.KEY_RESOURCE, keyName,
+        KMSRESTConstants.REENCRYPT_BATCH_SUB_RESOURCE, null);
+    final HttpURLConnection conn = createConnection(url, HTTP_POST);
+    conn.setRequestProperty(CONTENT_TYPE, APPLICATION_JSON_MIME);
+    final List<Map> response =
+        call(conn, jsonPayload, HttpURLConnection.HTTP_OK, List.class);
+    Preconditions.checkArgument(response.size() == ekvs.size(),
+        "Response size is different than input size.");
+    for (int i = 0; i < response.size(); ++i) {
+      final Map item = response.get(i);
+      final EncryptedKeyVersion ekv = parseJSONEncKeyVersion(keyName, item);
+      ekvs.set(i, ekv);
+    }
+  }
+
+  @Override
   public List<KeyVersion> getKeyVersions(String name) throws IOException {
     checkNotEmpty(name, "name");
     URL url = createURL(KMSRESTConstants.KEY_RESOURCE, name,
@@ -839,12 +901,102 @@ public class KMSClientProvider extends KeyProvider implements CryptoExtension,
   }
 
   @VisibleForTesting
-  public int getEncKeyQueueSize(String keyName) throws IOException {
+  public int getEncKeyQueueSize(String keyName) {
+    return encKeyVersionQueue.getSize(keyName);
+  }
+
+  @Override
+  public long renewDelegationToken(final Token<?> dToken) throws IOException {
     try {
-      return encKeyVersionQueue.getSize(keyName);
-    } catch (ExecutionException e) {
-      throw new IOException(e);
+      final String doAsUser = getDoAsUser();
+      final DelegationTokenAuthenticatedURL.Token token =
+          generateDelegationToken(dToken);
+      final URL url = createURL(null, null, null, null);
+      LOG.debug("Renewing delegation token {} with url:{}, as:{}",
+          token, url, doAsUser);
+      final DelegationTokenAuthenticatedURL authUrl =
+          new DelegationTokenAuthenticatedURL(configurator);
+      return getActualUgi().doAs(
+          new PrivilegedExceptionAction<Long>() {
+            @Override
+            public Long run() throws Exception {
+              return authUrl.renewDelegationToken(url, token, doAsUser);
+            }
+          }
+      );
+    } catch (Exception ex) {
+      if (ex instanceof IOException) {
+        throw (IOException) ex;
+      } else {
+        throw new IOException(ex);
+      }
     }
+  }
+
+  @Override
+  public Void cancelDelegationToken(final Token<?> dToken) throws IOException {
+    try {
+      final String doAsUser = getDoAsUser();
+      final DelegationTokenAuthenticatedURL.Token token =
+          generateDelegationToken(dToken);
+      return getActualUgi().doAs(
+          new PrivilegedExceptionAction<Void>() {
+            @Override
+            public Void run() throws Exception {
+              final URL url = createURL(null, null, null, null);
+              LOG.debug("Cancelling delegation token {} with url:{}, as:{}",
+                  dToken, url, doAsUser);
+              final DelegationTokenAuthenticatedURL authUrl =
+                  new DelegationTokenAuthenticatedURL(configurator);
+              authUrl.cancelDelegationToken(url, token, doAsUser);
+              return null;
+            }
+          }
+      );
+    } catch (Exception ex) {
+      if (ex instanceof IOException) {
+        throw (IOException) ex;
+      } else {
+        throw new IOException(ex);
+      }
+    }
+  }
+
+  /**
+   * Get the doAs user name.
+   *
+   * 'actualUGI' is the UGI of the user creating the client
+   * It is possible that the creator of the KMSClientProvier
+   * calls this method on behalf of a proxyUser (the doAsUser).
+   * In which case this call has to be made as the proxy user.
+   *
+   * @return the doAs user name.
+   * @throws IOException
+   */
+  private String getDoAsUser() throws IOException {
+    UserGroupInformation currentUgi = UserGroupInformation.getCurrentUser();
+    return (currentUgi.getAuthenticationMethod() ==
+        UserGroupInformation.AuthenticationMethod.PROXY)
+        ? currentUgi.getShortUserName() : null;
+  }
+
+  /**
+   * Generate a DelegationTokenAuthenticatedURL.Token from the given generic
+   * typed delegation token.
+   *
+   * @param dToken The delegation token.
+   * @return The DelegationTokenAuthenticatedURL.Token, with its delegation
+   *         token set to the delegation token passed in.
+   */
+  private DelegationTokenAuthenticatedURL.Token generateDelegationToken(
+      final Token<?> dToken) {
+    DelegationTokenAuthenticatedURL.Token token =
+        new DelegationTokenAuthenticatedURL.Token();
+    Token<AbstractDelegationTokenIdentifier> dt =
+        new Token<>(dToken.getIdentifier(), dToken.getPassword(),
+            dToken.getKind(), dToken.getService());
+    token.setDelegationToken(dt);
+    return token;
   }
 
   @Override
@@ -858,25 +1010,19 @@ public class KMSClientProvider extends KeyProvider implements CryptoExtension,
       final DelegationTokenAuthenticatedURL authUrl =
           new DelegationTokenAuthenticatedURL(configurator);
       try {
-        // 'actualUGI' is the UGI of the user creating the client 
-        // It is possible that the creator of the KMSClientProvier
-        // calls this method on behalf of a proxyUser (the doAsUser).
-        // In which case this call has to be made as the proxy user.
-        UserGroupInformation currentUgi = UserGroupInformation.getCurrentUser();
-        final String doAsUser = (currentUgi.getAuthenticationMethod() ==
-            UserGroupInformation.AuthenticationMethod.PROXY)
-                                ? currentUgi.getShortUserName() : null;
-
-        token = actualUgi.doAs(new PrivilegedExceptionAction<Token<?>>() {
+        final String doAsUser = getDoAsUser();
+        token = getActualUgi().doAs(new PrivilegedExceptionAction<Token<?>>() {
           @Override
           public Token<?> run() throws Exception {
             // Not using the cached token here.. Creating a new token here
             // everytime.
+            LOG.debug("Getting new token from {}, renewer:{}", url, renewer);
             return authUrl.getDelegationToken(url,
                 new DelegationTokenAuthenticatedURL.Token(), renewer, doAsUser);
           }
         });
         if (token != null) {
+          LOG.debug("New token received: ({})", token);
           credentials.addToken(token.getService(), token);
           tokens = new Token<?>[] { token };
         } else {
@@ -899,6 +1045,44 @@ public class KMSClientProvider extends KeyProvider implements CryptoExtension,
     return dtService;
   }
 
+  private boolean containsKmsDt(UserGroupInformation ugi) throws IOException {
+    // Add existing credentials from the UGI, since provider is cached.
+    Credentials creds = ugi.getCredentials();
+    if (!creds.getAllTokens().isEmpty()) {
+      org.apache.hadoop.security.token.Token<? extends TokenIdentifier>
+          dToken = creds.getToken(getDelegationTokenService());
+      if (dToken != null) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private UserGroupInformation getActualUgi() throws IOException {
+    final UserGroupInformation currentUgi = UserGroupInformation
+        .getCurrentUser();
+    if (LOG.isDebugEnabled()) {
+      UserGroupInformation.logAllUserInfo(currentUgi);
+    }
+    // Use current user by default
+    UserGroupInformation actualUgi = currentUgi;
+    if (currentUgi.getRealUser() != null) {
+      // Use real user for proxy user
+      actualUgi = currentUgi.getRealUser();
+    }
+    if (UserGroupInformation.isSecurityEnabled() &&
+        !containsKmsDt(actualUgi) &&
+        !actualUgi.hasKerberosCredentials()) {
+      // Use login user is only necessary when Kerberos is enabled
+      // but the actual user does not have either
+      // Kerberos credential or KMS delegation token for KMS operations
+      LOG.debug("Using loginUser when Kerberos is enabled but the actual user" +
+          " does not have either KMS Delegation Token or Kerberos Credentials");
+      actualUgi = UserGroupInformation.getLoginUser();
+    }
+    return actualUgi;
+  }
+
   /**
    * Shutdown valueQueue executor threads
    */
@@ -911,6 +1095,7 @@ public class KMSClientProvider extends KeyProvider implements CryptoExtension,
     } finally {
       if (sslFactory != null) {
         sslFactory.destroy();
+        sslFactory = null;
       }
     }
   }

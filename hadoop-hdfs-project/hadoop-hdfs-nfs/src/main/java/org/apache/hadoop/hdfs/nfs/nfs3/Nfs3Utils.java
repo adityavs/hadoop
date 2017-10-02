@@ -65,7 +65,9 @@ public class Nfs3Utils {
      * client takes only the lower 32bit of the fileId and treats it as signed
      * int. When the 32th bit is 1, the client considers it invalid.
      */
-    NfsFileType fileType = fs.isDir() ? NfsFileType.NFSDIR : NfsFileType.NFSREG;
+    NfsFileType fileType = fs.isDirectory()
+        ? NfsFileType.NFSDIR
+        : NfsFileType.NFSREG;
     fileType = fs.isSymlink() ? NfsFileType.NFSLNK : fileType;
     int nlink = (fileType == NfsFileType.NFSDIR) ? fs.getChildrenNum() + 2 : 1;
     long size = (fileType == NfsFileType.NFSDIR) ? getDirSize(fs
@@ -86,6 +88,8 @@ public class Nfs3Utils {
   /**
    * HDFS directory size is always zero. Try to return something meaningful
    * here. Assume each child take 32bytes.
+   * @param childNum number of children of the directory
+   * @return total size of the directory
    */
   public static long getDirSize(int childNum) {
     return (childNum + 2) * 32;
@@ -98,7 +102,7 @@ public class Nfs3Utils {
       return null;
     }
 
-    long size = fstat.isDir() ? getDirSize(fstat.getChildrenNum()) : fstat
+    long size = fstat.isDirectory() ? getDirSize(fstat.getChildrenNum()) : fstat
         .getLen();
     return new WccAttr(size, new NfsTime(fstat.getModificationTime()),
         new NfsTime(fstat.getModificationTime()));
@@ -120,6 +124,9 @@ public class Nfs3Utils {
 
   /**
    * Send a write response to the netty network socket channel
+   * @param channel channel to which the buffer needs to be written
+   * @param out xdr object to be written to the channel
+   * @param xid transaction identifier
    */
   public static void writeChannel(Channel channel, XDR out, int xid) {
     if (channel == null) {

@@ -19,6 +19,8 @@
 package org.apache.hadoop.yarn.server.resourcemanager.scheduler.policy;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentSkipListSet;
+
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainer;
@@ -35,7 +37,7 @@ public abstract class AbstractComparatorOrderingPolicy<S extends SchedulableEnti
   
   private static final Log LOG = LogFactory.getLog(OrderingPolicy.class);
                                             
-  protected TreeSet<S> schedulableEntities;
+  protected ConcurrentSkipListSet<S> schedulableEntities;
   protected Comparator<SchedulableEntity> comparator;
   protected Map<String, S> entitiesToReorder = new HashMap<String, S>();
   
@@ -94,11 +96,17 @@ public abstract class AbstractComparatorOrderingPolicy<S extends SchedulableEnti
   
   @Override
   public void addSchedulableEntity(S s) {
+    if (null == s) {
+      return;
+    }
     schedulableEntities.add(s); 
   }
   
   @Override
   public boolean removeSchedulableEntity(S s) {
+    if (null == s) {
+      return false;
+    }
     synchronized (entitiesToReorder) {
       entitiesToReorder.remove(s.getId());
     }

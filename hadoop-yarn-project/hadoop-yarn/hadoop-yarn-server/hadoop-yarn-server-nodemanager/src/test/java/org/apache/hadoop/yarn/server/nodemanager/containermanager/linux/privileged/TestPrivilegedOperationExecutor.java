@@ -20,13 +20,13 @@
 
 package org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.privileged;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.util.ArrayList;
@@ -34,8 +34,8 @@ import java.util.Arrays;
 import java.util.List;
 
 public class TestPrivilegedOperationExecutor {
-  private static final Log LOG = LogFactory
-      .getLog(TestPrivilegedOperationExecutor.class);
+  private static final Logger LOG =
+       LoggerFactory.getLogger(TestPrivilegedOperationExecutor.class);
   private String localDataDir;
   private String customExecutorPath;
   private Configuration nullConf = null;
@@ -69,7 +69,7 @@ public class TestPrivilegedOperationExecutor {
     cGroupTasks2 = "net_cls/hadoop_yarn/container_01/tasks";
     cGroupTasks3 = "blkio/hadoop_yarn/container_01/tasks";
     opDisallowed = new PrivilegedOperation
-        (PrivilegedOperation.OperationType.DELETE_AS_USER, (String) null);
+        (PrivilegedOperation.OperationType.DELETE_AS_USER);
     opTasksNone = new PrivilegedOperation
         (PrivilegedOperation.OperationType.ADD_PID_TO_CGROUP,
             PrivilegedOperation.CGROUP_ARG_PREFIX + cGroupTasksNone);
@@ -118,7 +118,7 @@ public class TestPrivilegedOperationExecutor {
     PrivilegedOperationExecutor exec = PrivilegedOperationExecutor
         .getInstance(confWithExecutorPath);
     PrivilegedOperation op = new PrivilegedOperation(PrivilegedOperation
-        .OperationType.LAUNCH_CONTAINER, (String) null);
+        .OperationType.TC_MODIFY_STATE);
     String[] cmdArray = exec.getPrivilegedOperationExecutionCommand(null, op);
 
     //No arguments added - so the resulting array should consist of
@@ -127,10 +127,8 @@ public class TestPrivilegedOperationExecutor {
     Assert.assertEquals(customExecutorPath, cmdArray[0]);
     Assert.assertEquals(op.getOperationType().getOption(), cmdArray[1]);
 
-    //other (dummy) arguments to launch container
-    String[] additionalArgs = { "test_user", "yarn", "1", "app_01",
-        "container_01", "workdir", "launch_script.sh", "tokens", "pidfile",
-        "nm-local-dirs", "nm-log-dirs", "resource-spec" };
+    //other (dummy) arguments to tc modify state
+    String[] additionalArgs = { "cmd_file_1", "cmd_file_2", "cmd_file_3"};
 
     op.appendArgs(additionalArgs);
     cmdArray = exec.getPrivilegedOperationExecutionCommand(null, op);
@@ -217,8 +215,10 @@ public class TestPrivilegedOperationExecutor {
           .squashCGroupOperations(ops);
       String expected = new StringBuffer
           (PrivilegedOperation.CGROUP_ARG_PREFIX)
-          .append(cGroupTasks1).append(',')
-          .append(cGroupTasks2).append(',')
+          .append(cGroupTasks1).append(PrivilegedOperation
+              .LINUX_FILE_PATH_SEPARATOR)
+          .append(cGroupTasks2).append(PrivilegedOperation
+              .LINUX_FILE_PATH_SEPARATOR)
           .append(cGroupTasks3).toString();
 
       //We expect axactly one argument

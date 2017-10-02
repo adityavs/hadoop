@@ -21,6 +21,7 @@ package org.apache.hadoop.mapreduce.v2.app;
 import java.io.IOException;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
+import java.nio.file.Paths;
 import java.security.NoSuchAlgorithmException;
 import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
@@ -34,6 +35,10 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import javax.crypto.KeyGenerator;
 
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.logging.Log;
@@ -42,6 +47,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.ipc.CallerContext;
 import org.apache.hadoop.mapred.FileOutputCommitter;
 import org.apache.hadoop.mapred.JobConf;
 import org.apache.hadoop.mapred.LocalContainerLauncher;
@@ -56,7 +62,6 @@ import org.apache.hadoop.mapreduce.OutputFormat;
 import org.apache.hadoop.mapreduce.TaskAttemptContext;
 import org.apache.hadoop.mapreduce.TaskAttemptID;
 import org.apache.hadoop.mapreduce.TypeConverter;
-import org.apache.hadoop.mapreduce.counters.Limits;
 import org.apache.hadoop.mapreduce.jobhistory.AMStartedEvent;
 import org.apache.hadoop.mapreduce.jobhistory.EventReader;
 import org.apache.hadoop.mapreduce.jobhistory.EventType;
@@ -119,6 +124,7 @@ import org.apache.hadoop.mapreduce.v2.util.MRBuilderUtils;
 import org.apache.hadoop.mapreduce.v2.util.MRWebAppUtil;
 import org.apache.hadoop.metrics2.lib.DefaultMetricsSystem;
 import org.apache.hadoop.security.Credentials;
+import org.apache.hadoop.security.SecurityUtil;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.service.AbstractService;
@@ -135,6 +141,8 @@ import org.apache.hadoop.yarn.api.ApplicationConstants.Environment;
 import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.ContainerId;
+import org.apache.hadoop.yarn.client.api.TimelineClient;
+import org.apache.hadoop.yarn.client.api.TimelineV2Client;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.event.AsyncDispatcher;
 import org.apache.hadoop.yarn.event.Dispatcher;
@@ -144,13 +152,9 @@ import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
 import org.apache.hadoop.yarn.security.AMRMTokenIdentifier;
 import org.apache.hadoop.yarn.security.client.ClientToAMTokenSecretManager;
 import org.apache.hadoop.yarn.util.Clock;
-import org.apache.hadoop.yarn.util.ConverterUtils;
 import org.apache.hadoop.yarn.util.SystemClock;
-import org.apache.log4j.LogManager;
 
 import com.google.common.annotations.VisibleForTesting;
-
-import javax.crypto.KeyGenerator;
 
 /**
  * The Map-Reduce Application Master.
@@ -233,7 +237,7 @@ public class MRAppMaster extends CompositeService {
   JobStateInternal forcedState = null;
   private final ScheduledExecutorService logSyncer;
 
-  private long recoveredJobStartTime = 0;
+  private long recoveredJobStartTime = -1L;
   private static boolean mainStarted = false;
 
   @VisibleForTesting
@@ -244,7 +248,7 @@ public class MRAppMaster extends CompositeService {
       ContainerId containerId, String nmHost, int nmPort, int nmHttpPort,
       long appSubmitTime) {
     this(applicationAttemptId, containerId, nmHost, nmPort, nmHttpPort,
-        new SystemClock(), appSubmitTime);
+        SystemClock.getInstance(), appSubmitTime);
   }
 
   public MRAppMaster(ApplicationAttemptId applicationAttemptId,
@@ -275,8 +279,6 @@ public class MRAppMaster extends CompositeService {
     // create the job classloader if enabled
     createJobClassLoader(conf);
 
-    conf.setBoolean(Dispatcher.DISPATCHER_EXIT_ON_ERROR_KEY, true);
-
     initJobCredentialsAndUGI(conf);
 
     dispatcher = createDispatcher();
@@ -304,10 +306,12 @@ public class MRAppMaster extends CompositeService {
     }
     
     boolean copyHistory = false;
+    committer = createOutputCommitter(conf);
     try {
       String user = UserGroupInformation.getCurrentUser().getShortUserName();
       Path stagingDir = MRApps.getStagingAreaDir(conf, user);
       FileSystem fs = getFileSystem(conf);
+
       boolean stagingExists = fs.exists(stagingDir);
       Path startCommitFile = MRApps.getStartJobCommitFile(conf, user, jobId);
       boolean commitStarted = fs.exists(startCommitFile);
@@ -344,17 +348,24 @@ public class MRAppMaster extends CompositeService {
               "before it crashed. Not retrying.";
           forcedState = JobStateInternal.FAILED;
         } else {
-          //The commit is still pending, commit error
-          shutDownMessage =
-              "Job commit from a prior MRAppMaster attempt is " +
-              "potentially in progress. Preventing multiple commit executions";
-          forcedState = JobStateInternal.ERROR;
+          if (isCommitJobRepeatable()) {
+            // cleanup previous half done commits if committer supports
+            // repeatable job commit.
+            errorHappenedShutDown = false;
+            cleanupInterruptedCommit(conf, fs, startCommitFile);
+          } else {
+            //The commit is still pending, commit error
+            shutDownMessage =
+                "Job commit from a prior MRAppMaster attempt is " +
+                "potentially in progress. Preventing multiple commit executions";
+            forcedState = JobStateInternal.ERROR;
+          }
         }
       }
     } catch (IOException e) {
       throw new YarnRuntimeException("Error while initializing", e);
     }
-    
+
     if (errorHappenedShutDown) {
       NoopEventHandler eater = new NoopEventHandler();
       //We do not have a JobEventDispatcher in this path
@@ -400,7 +411,6 @@ public class MRAppMaster extends CompositeService {
         addIfService(cpHist);
       }
     } else {
-      committer = createOutputCommitter(conf);
 
       //service to handle requests from JobClient
       clientService = createClientService(context);
@@ -486,6 +496,38 @@ public class MRAppMaster extends CompositeService {
     return new AsyncDispatcher();
   }
 
+  private boolean isCommitJobRepeatable() throws IOException {
+    boolean isRepeatable = false;
+    Configuration conf = getConfig();
+    if (committer != null) {
+      final JobContext jobContext = getJobContextFromConf(conf);
+
+      isRepeatable = callWithJobClassLoader(conf,
+          new ExceptionAction<Boolean>() {
+            public Boolean call(Configuration conf) throws IOException {
+              return committer.isCommitJobRepeatable(jobContext);
+            }
+          });
+    }
+    return isRepeatable;
+  }
+
+  private JobContext getJobContextFromConf(Configuration conf) {
+    if (newApiCommitter) {
+      return new JobContextImpl(conf, TypeConverter.fromYarn(getJobId()));
+    } else {
+      return new org.apache.hadoop.mapred.JobContextImpl(
+          new JobConf(conf), TypeConverter.fromYarn(getJobId()));
+    }
+  }
+
+  private void cleanupInterruptedCommit(Configuration conf,
+      FileSystem fs, Path startCommitFile) throws IOException {
+    LOG.info("Delete startJobCommitFile in case commit is not finished as " +
+        "successful or failed.");
+    fs.delete(startCommitFile, false);
+  }
+
   private OutputCommitter createOutputCommitter(Configuration conf) {
     return callWithJobClassLoader(conf, new Action<OutputCommitter>() {
       public OutputCommitter call(Configuration conf) {
@@ -526,9 +568,29 @@ public class MRAppMaster extends CompositeService {
           NoopAMPreemptionPolicy.class, AMPreemptionPolicy.class), conf);
   }
 
-  protected boolean keepJobFiles(JobConf conf) {
-    return (conf.getKeepTaskFilesPattern() != null || conf
-        .getKeepFailedTaskFiles());
+  private boolean isJobNamePatternMatch(JobConf conf, String jobTempDir) {
+    // Matched staging files should be preserved after job is finished.
+    if (conf.getKeepTaskFilesPattern() != null && jobTempDir != null) {
+      java.nio.file.Path pathName = Paths.get(jobTempDir).getFileName();
+      if (pathName != null) {
+        String jobFileName = pathName.toString();
+        Pattern pattern = Pattern.compile(conf.getKeepTaskFilesPattern());
+        Matcher matcher = pattern.matcher(jobFileName);
+        return matcher.find();
+      }
+    }
+    return false;
+  }
+
+  private boolean isKeepFailedTaskFiles(JobConf conf) {
+    // TODO: Decide which failed task files that should
+    // be kept are in application log directory.
+    return conf.getKeepFailedTaskFiles();
+  }
+
+  protected boolean keepJobFiles(JobConf conf, String jobTempDir) {
+    return isJobNamePatternMatch(conf, jobTempDir)
+            || isKeepFailedTaskFiles(conf);
   }
   
   /**
@@ -551,11 +613,10 @@ public class MRAppMaster extends CompositeService {
    */
   public void cleanupStagingDir() throws IOException {
     /* make sure we clean the staging files */
-    String jobTempDir = null;
+    String jobTempDir = getConfig().get(MRJobConfig.MAPREDUCE_JOB_DIR);
     FileSystem fs = getFileSystem(getConfig());
     try {
-      if (!keepJobFiles(new JobConf(getConfig()))) {
-        jobTempDir = getConfig().get(MRJobConfig.MAPREDUCE_JOB_DIR);
+      if (!keepJobFiles(new JobConf(getConfig()), jobTempDir)) {
         if (jobTempDir == null) {
           LOG.warn("Job Staging directory is null");
           return;
@@ -584,6 +645,12 @@ public class MRAppMaster extends CompositeService {
     // note in a workflow scenario, this may lead to creation of a new
     // job (FIXME?)
 
+    JobEndNotifier notifier = null;
+    if (getConfig().get(MRJobConfig.MR_JOB_END_NOTIFICATION_URL) != null) {
+      notifier = new JobEndNotifier();
+      notifier.setConf(getConfig());
+    }
+
     try {
       //if isLastAMRetry comes as true, should never set it to false
       if ( !isLastAMRetry){
@@ -598,28 +665,11 @@ public class MRAppMaster extends CompositeService {
       LOG.info("Calling stop for all the services");
       MRAppMaster.this.stop();
 
-      if (isLastAMRetry) {
+      if (isLastAMRetry && notifier != null) {
         // Send job-end notification when it is safe to report termination to
         // users and it is the last AM retry
-        if (getConfig().get(MRJobConfig.MR_JOB_END_NOTIFICATION_URL) != null) {
-          try {
-            LOG.info("Job end notification started for jobID : "
-                + job.getReport().getJobId());
-            JobEndNotifier notifier = new JobEndNotifier();
-            notifier.setConf(getConfig());
-            JobReport report = job.getReport();
-            // If unregistration fails, the final state is unavailable. However,
-            // at the last AM Retry, the client will finally be notified FAILED
-            // from RM, so we should let users know FAILED via notifier as well
-            if (!context.hasSuccessfullyUnregistered()) {
-              report.setJobState(JobState.FAILED);
-            }
-            notifier.notify(report);
-          } catch (InterruptedException ie) {
-            LOG.warn("Job end notification interrupted for jobID : "
-                + job.getReport().getJobId(), ie);
-          }
-        }
+        sendJobEndNotify(notifier);
+        notifier = null;
       }
 
       try {
@@ -631,8 +681,30 @@ public class MRAppMaster extends CompositeService {
     } catch (Throwable t) {
       LOG.warn("Graceful stop failed. Exiting.. ", t);
       exitMRAppMaster(1, t);
+    } finally {
+      if (isLastAMRetry && notifier != null) {
+        sendJobEndNotify(notifier);
+      }
     }
     exitMRAppMaster(0, null);
+  }
+
+  private void sendJobEndNotify(JobEndNotifier notifier) {
+    try {
+      LOG.info("Job end notification started for jobID : "
+          + job.getReport().getJobId());
+      // If unregistration fails, the final state is unavailable. However,
+      // at the last AM Retry, the client will finally be notified FAILED
+      // from RM, so we should let users know FAILED via notifier as well
+      JobReport report = job.getReport();
+      if (!context.hasSuccessfullyUnregistered()) {
+        report.setJobState(JobState.FAILED);
+      }
+      notifier.notify(report);
+    } catch (InterruptedException ie) {
+      LOG.warn("Job end notification interrupted for jobID : "
+          + job.getReport().getJobId(), ie);
+    }
   }
 
   /** MRAppMaster exit method which has been instrumented for both runtime and
@@ -1004,6 +1076,9 @@ public class MRAppMaster extends CompositeService {
     private final Configuration conf;
     private final ClusterInfo clusterInfo = new ClusterInfo();
     private final ClientToAMTokenSecretManager clientToAMTokenSecretManager;
+    private TimelineClient timelineClient = null;
+    private TimelineV2Client timelineV2Client = null;
+    private String historyUrl = null;
 
     private final TaskAttemptFinishingMonitor taskAttemptFinishingMonitor;
 
@@ -1013,6 +1088,18 @@ public class MRAppMaster extends CompositeService {
       this.clientToAMTokenSecretManager =
           new ClientToAMTokenSecretManager(appAttemptID, null);
       this.taskAttemptFinishingMonitor = taskAttemptFinishingMonitor;
+      if (conf.getBoolean(MRJobConfig.MAPREDUCE_JOB_EMIT_TIMELINE_DATA,
+              MRJobConfig.DEFAULT_MAPREDUCE_JOB_EMIT_TIMELINE_DATA)
+            && YarnConfiguration.timelineServiceEnabled(conf)) {
+
+        if (YarnConfiguration.timelineServiceV2Enabled(conf)) {
+          // create new version TimelineClient
+          timelineV2Client = TimelineV2Client.createTimelineClient(
+              appAttemptID.getApplicationId());
+        } else {
+          timelineClient = TimelineClient.createTimelineClient();
+        }
+      }
     }
 
     @Override
@@ -1046,7 +1133,7 @@ public class MRAppMaster extends CompositeService {
     }
 
     @Override
-    public EventHandler getEventHandler() {
+    public EventHandler<Event> getEventHandler() {
       return dispatcher.getEventHandler();
     }
 
@@ -1103,6 +1190,24 @@ public class MRAppMaster extends CompositeService {
       return taskAttemptFinishingMonitor;
     }
 
+    public TimelineClient getTimelineClient() {
+      return timelineClient;
+    }
+
+    // Get Timeline Collector's address (get sync from RM)
+    public TimelineV2Client getTimelineV2Client() {
+      return timelineV2Client;
+    }
+
+    @Override
+    public String getHistoryUrl() {
+      return historyUrl;
+    }
+
+    @Override
+    public void setHistoryUrl(String historyUrl) {
+      this.historyUrl = historyUrl;
+    }
   }
 
   @SuppressWarnings("unchecked")
@@ -1186,8 +1291,6 @@ public class MRAppMaster extends CompositeService {
 
     // finally set the job classloader
     MRApps.setClassLoader(jobClassLoader, getConfig());
-    // set job classloader if configured
-    Limits.init(getConfig());
 
     if (initFailed) {
       JobEvent initFailedEvent = new JobEvent(job.getID(), JobEventType.JOB_INIT_FAILED);
@@ -1197,25 +1300,17 @@ public class MRAppMaster extends CompositeService {
       startJobs();
     }
   }
-  
+
   @Override
   public void stop() {
     super.stop();
-    TaskLog.syncLogsShutdown(logSyncer);
   }
 
   private boolean isRecoverySupported() throws IOException {
     boolean isSupported = false;
     Configuration conf = getConfig();
     if (committer != null) {
-      final JobContext _jobContext;
-      if (newApiCommitter) {
-         _jobContext = new JobContextImpl(
-            conf, TypeConverter.fromYarn(getJobId()));
-      } else {
-          _jobContext = new org.apache.hadoop.mapred.JobContextImpl(
-                new JobConf(conf), TypeConverter.fromYarn(getJobId()));
-      }
+      final JobContext _jobContext = getJobContextFromConf(conf);
       isSupported = callWithJobClassLoader(conf,
           new ExceptionAction<Boolean>() {
             public Boolean call(Configuration conf) throws IOException {
@@ -1227,44 +1322,77 @@ public class MRAppMaster extends CompositeService {
   }
 
   private void processRecovery() throws IOException{
-    if (appAttemptID.getAttemptId() == 1) {
-      return;  // no need to recover on the first attempt
+    boolean attemptRecovery = shouldAttemptRecovery();
+    boolean recoverySucceeded = true;
+    if (attemptRecovery) {
+      LOG.info("Attempting to recover.");
+      try {
+        parsePreviousJobHistory();
+      } catch (IOException e) {
+        LOG.warn("Unable to parse prior job history, aborting recovery", e);
+        recoverySucceeded = false;
+      }
+    }
+
+    if (!isFirstAttempt() && (!attemptRecovery || !recoverySucceeded)) {
+      amInfos.addAll(readJustAMInfos());
+    }
+  }
+
+  private boolean isFirstAttempt() {
+    return appAttemptID.getAttemptId() == 1;
+  }
+
+  /**
+   * Check if the current job attempt should try to recover from previous
+   * job attempts if any.
+   */
+  private boolean shouldAttemptRecovery() throws IOException {
+    if (isFirstAttempt()) {
+      return false;  // no need to recover on the first attempt
     }
 
     boolean recoveryEnabled = getConfig().getBoolean(
         MRJobConfig.MR_AM_JOB_RECOVERY_ENABLE,
         MRJobConfig.MR_AM_JOB_RECOVERY_ENABLE_DEFAULT);
+    if (!recoveryEnabled) {
+      LOG.info("Not attempting to recover. Recovery disabled. To enable " +
+          "recovery, set " + MRJobConfig.MR_AM_JOB_RECOVERY_ENABLE);
+      return false;
+    }
 
     boolean recoverySupportedByCommitter = isRecoverySupported();
+    if (!recoverySupportedByCommitter) {
+      LOG.info("Not attempting to recover. Recovery is not supported by " +
+          committer.getClass() + ". Use an OutputCommitter that supports" +
+              " recovery.");
+      return false;
+    }
 
-    // If a shuffle secret was not provided by the job client then this app
-    // attempt will generate one.  However that disables recovery if there
-    // are reducers as the shuffle secret would be app attempt specific.
-    int numReduceTasks = getConfig().getInt(MRJobConfig.NUM_REDUCES, 0);
+    int reducerCount = getConfig().getInt(MRJobConfig.NUM_REDUCES, 0);
+
+    // If a shuffle secret was not provided by the job client, one will be
+    // generated in this job attempt. However, that disables recovery if
+    // there are reducers as the shuffle secret would be job attempt specific.
     boolean shuffleKeyValidForRecovery =
         TokenCache.getShuffleSecretKey(jobCredentials) != null;
-
-    if (recoveryEnabled && recoverySupportedByCommitter
-        && (numReduceTasks <= 0 || shuffleKeyValidForRecovery)) {
-      LOG.info("Recovery is enabled. "
-          + "Will try to recover from previous life on best effort basis.");
-      try {
-        parsePreviousJobHistory();
-      } catch (IOException e) {
-        LOG.warn("Unable to parse prior job history, aborting recovery", e);
-        // try to get just the AMInfos
-        amInfos.addAll(readJustAMInfos());
-      }
-    } else {
-      LOG.info("Will not try to recover. recoveryEnabled: "
-            + recoveryEnabled + " recoverySupportedByCommitter: "
-            + recoverySupportedByCommitter + " numReduceTasks: "
-            + numReduceTasks + " shuffleKeyValidForRecovery: "
-            + shuffleKeyValidForRecovery + " ApplicationAttemptID: "
-            + appAttemptID.getAttemptId());
-      // Get the amInfos anyways whether recovery is enabled or not
-      amInfos.addAll(readJustAMInfos());
+    if (reducerCount > 0 && !shuffleKeyValidForRecovery) {
+      LOG.info("Not attempting to recover. The shuffle key is invalid for " +
+          "recovery.");
+      return false;
     }
+
+    // If the intermediate data is encrypted, recovering the job requires the
+    // access to the key. Until the encryption key is persisted, we should
+    // avoid attempts to recover.
+    boolean spillEncrypted = CryptoUtils.isEncryptedSpillEnabled(getConfig());
+    if (reducerCount > 0 && spillEncrypted) {
+      LOG.info("Not attempting to recover. Intermediate spill encryption" +
+          " is enabled.");
+      return false;
+    }
+
+    return true;
   }
 
   private static FSDataInputStream getPreviousJobHistoryStream(
@@ -1362,6 +1490,10 @@ public class MRAppMaster extends CompositeService {
       }
     }
     return amInfos;
+  }
+
+  public boolean recovered() {
+    return recoveredJobStartTime > 0;
   }
 
   /**
@@ -1504,9 +1636,13 @@ public class MRAppMaster extends CompositeService {
       validateInputParam(appSubmitTimeStr,
           ApplicationConstants.APP_SUBMIT_TIME_ENV);
 
-      ContainerId containerId = ConverterUtils.toContainerId(containerIdStr);
+      ContainerId containerId = ContainerId.fromString(containerIdStr);
       ApplicationAttemptId applicationAttemptId =
           containerId.getApplicationAttemptId();
+      if (applicationAttemptId != null) {
+        CallerContext.setCurrent(new CallerContext.Builder(
+            "mr_appmaster_" + applicationAttemptId.toString()).build());
+      }
       long appSubmitTime = Long.parseLong(appSubmitTimeStr);
       
       
@@ -1574,6 +1710,8 @@ public class MRAppMaster extends CompositeService {
       final JobConf conf, String jobUserName) throws IOException,
       InterruptedException {
     UserGroupInformation.setConfiguration(conf);
+    // MAPREDUCE-6565: need to set configuration for SecurityUtil.
+    SecurityUtil.setConfiguration(conf);
     // Security framework already loaded the tokens into current UGI, just use
     // them
     Credentials credentials =
@@ -1708,7 +1846,6 @@ public class MRAppMaster extends CompositeService {
   @Override
   protected void serviceStop() throws Exception {
     super.serviceStop();
-    LogManager.shutdown();
   }
 
   public ClientService getClientService() {

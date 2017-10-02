@@ -31,12 +31,11 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Random;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.io.DataInputBuffer;
 import org.apache.hadoop.io.DataOutputBuffer;
 import org.apache.hadoop.io.RandomDatum;
+import org.apache.hadoop.test.GenericTestUtils;
 import org.apache.hadoop.util.NativeCodeLoader;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.junit.Assert;
@@ -45,9 +44,12 @@ import org.junit.Before;
 import org.junit.Test;
 
 import com.google.common.primitives.Longs;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class TestCryptoCodec {
-  private static final Log LOG= LogFactory.getLog(TestCryptoCodec.class);
+  private static final Logger LOG= LoggerFactory.getLogger(TestCryptoCodec
+      .class);
   private static byte[] key = new byte[16];
   private static byte[] iv = new byte[16];
   private static final int bufferSize = 4096;
@@ -69,10 +71,7 @@ public class TestCryptoCodec {
 
   @Test(timeout=120000)
   public void testJceAesCtrCryptoCodec() throws Exception {
-    if (!"true".equalsIgnoreCase(System.getProperty("runningWithNative"))) {
-      LOG.warn("Skipping since test was not run with -Pnative flag");
-      Assume.assumeTrue(false);
-    }
+    GenericTestUtils.assumeInNativeProfile();
     if (!NativeCodeLoader.buildSupportsOpenssl()) {
       LOG.warn("Skipping test since openSSL library not loaded");
       Assume.assumeTrue(false);
@@ -91,10 +90,7 @@ public class TestCryptoCodec {
   
   @Test(timeout=120000)
   public void testOpensslAesCtrCryptoCodec() throws Exception {
-    if (!"true".equalsIgnoreCase(System.getProperty("runningWithNative"))) {
-      LOG.warn("Skipping since test was not run with -Pnative flag");
-      Assume.assumeTrue(false);
-    }
+    GenericTestUtils.assumeInNativeProfile();
     if (!NativeCodeLoader.buildSupportsOpenssl()) {
       LOG.warn("Skipping test since openSSL library not loaded");
       Assume.assumeTrue(false);

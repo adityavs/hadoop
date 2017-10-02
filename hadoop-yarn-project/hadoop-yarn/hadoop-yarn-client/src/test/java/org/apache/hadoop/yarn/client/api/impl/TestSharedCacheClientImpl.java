@@ -19,6 +19,7 @@
 package org.apache.hadoop.yarn.client.api.impl;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 import static org.mockito.Matchers.isA;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -38,6 +39,7 @@ import org.apache.hadoop.yarn.api.protocolrecords.UseSharedCacheResourceRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.UseSharedCacheResourceResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.impl.pb.UseSharedCacheResourceResponsePBImpl;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
+import org.apache.hadoop.yarn.api.records.URL;
 import org.apache.hadoop.yarn.exceptions.YarnException;
 import org.junit.After;
 import org.junit.AfterClass;
@@ -106,15 +108,27 @@ public class TestSharedCacheClientImpl {
   }
 
   @Test
-  public void testUse() throws Exception {
+  public void testUseCacheMiss() throws Exception {
+    UseSharedCacheResourceResponse response =
+        new UseSharedCacheResourceResponsePBImpl();
+    response.setPath(null);
+    when(cProtocol.use(isA(UseSharedCacheResourceRequest.class))).thenReturn(
+        response);
+    URL newURL = client.use(mock(ApplicationId.class), "key");
+    assertNull("The path is not null!", newURL);
+  }
+
+  @Test
+  public void testUseCacheHit() throws Exception {
     Path file = new Path("viewfs://test/path");
+    URL useUrl = URL.fromPath(new Path("viewfs://test/path"));
     UseSharedCacheResourceResponse response =
         new UseSharedCacheResourceResponsePBImpl();
     response.setPath(file.toString());
     when(cProtocol.use(isA(UseSharedCacheResourceRequest.class))).thenReturn(
         response);
-    Path newPath = client.use(mock(ApplicationId.class), "key");
-    assertEquals(file, newPath);
+    URL newURL = client.use(mock(ApplicationId.class), "key");
+    assertEquals("The paths are not equal!", useUrl, newURL);
   }
 
   @Test(expected = YarnException.class)

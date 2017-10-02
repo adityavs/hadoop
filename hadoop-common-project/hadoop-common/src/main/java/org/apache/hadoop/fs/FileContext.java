@@ -35,8 +35,6 @@ import java.util.Stack;
 import java.util.TreeSet;
 import java.util.Map.Entry;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.HadoopIllegalArgumentException;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
@@ -46,9 +44,11 @@ import org.apache.hadoop.fs.Options.CreateOpts;
 import org.apache.hadoop.fs.permission.AclEntry;
 import org.apache.hadoop.fs.permission.AclStatus;
 import org.apache.hadoop.fs.permission.FsAction;
+import org.apache.hadoop.fs.permission.FsCreateModes;
 import org.apache.hadoop.fs.permission.FsPermission;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.FS_DEFAULT_NAME_KEY;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.FS_DEFAULT_NAME_DEFAULT;
+
 import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.ipc.RpcClientException;
 import org.apache.hadoop.ipc.RpcServerException;
@@ -58,6 +58,11 @@ import org.apache.hadoop.security.AccessControlException;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.util.ShutdownHookManager;
+
+import com.google.common.base.Preconditions;
+import org.apache.htrace.core.Tracer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * The FileContext class provides an interface for users of the Hadoop
@@ -161,10 +166,10 @@ import org.apache.hadoop.util.ShutdownHookManager;
  */
 
 @InterfaceAudience.Public
-@InterfaceStability.Evolving /*Evolving for a release,to be changed to Stable */
+@InterfaceStability.Stable
 public class FileContext {
   
-  public static final Log LOG = LogFactory.getLog(FileContext.class);
+  public static final Logger LOG = LoggerFactory.getLogger(FileContext.class);
   /**
    * Default permission for directory and symlink
    * In previous versions, this default permission was also used to
@@ -211,20 +216,20 @@ public class FileContext {
    * The FileContext is defined by.
    *  1) defaultFS (slash)
    *  2) wd
-   *  3) umask
+   *  3) umask (Obtained by FsPermission.getUMask(conf))
    */   
   private final AbstractFileSystem defaultFS; //default FS for this FileContext.
   private Path workingDir;          // Fully qualified
-  private FsPermission umask;
   private final Configuration conf;
   private final UserGroupInformation ugi;
   final boolean resolveSymlinks;
+  private final Tracer tracer;
 
   private FileContext(final AbstractFileSystem defFs,
-    final FsPermission theUmask, final Configuration aConf) {
+                      final Configuration aConf) {
     defaultFS = defFs;
-    umask = FsPermission.getUMask(aConf);
     conf = aConf;
+    tracer = FsTracer.get(aConf);
     try {
       ugi = UserGroupInformation.getCurrentUser();
     } catch (IOException e) {
@@ -262,6 +267,7 @@ public class FileContext {
    * has been deliberately declared private.
    */
   Path fixRelativePart(Path p) {
+    Preconditions.checkNotNull(p, "path cannot be null");
     if (p.isUriPathAbsolute()) {
       return p;
     } else {
@@ -298,7 +304,7 @@ public class FileContext {
    * 
    * @throws UnsupportedFileSystemException If the file system for
    *           <code>absOrFqPath</code> is not supported.
-   * @throws IOExcepton If the file system for <code>absOrFqPath</code> could
+   * @throws IOException If the file system for <code>absOrFqPath</code> could
    *         not be instantiated.
    */
   protected AbstractFileSystem getFSofPath(final Path absOrFqPath)
@@ -325,8 +331,17 @@ public class FileContext {
           return AbstractFileSystem.get(uri, conf);
         }
       });
+    } catch (RuntimeException ex) {
+      // RTEs can wrap other exceptions; if there is an IOException inner,
+      // throw it direct.
+      Throwable cause = ex.getCause();
+      if (cause instanceof IOException) {
+        throw (IOException) cause;
+      } else {
+        throw ex;
+      }
     } catch (InterruptedException ex) {
-      LOG.error(ex);
+      LOG.error(ex.toString());
       throw new IOException("Failed to get the AbstractFileSystem for path: "
           + uri, ex);
     }
@@ -347,7 +362,7 @@ public class FileContext {
    */
   public static FileContext getFileContext(final AbstractFileSystem defFS,
                     final Configuration aConf) {
-    return new FileContext(defFS, FsPermission.getUMask(aConf), aConf);
+    return new FileContext(defFS, aConf);
   }
   
   /**
@@ -440,7 +455,7 @@ public class FileContext {
     } catch (UnsupportedFileSystemException ex) {
       throw ex;
     } catch (IOException ex) {
-      LOG.error(ex);
+      LOG.error(ex.toString());
       throw new RuntimeException(ex);
     }
     return getFileContext(defaultAfs, aConf);
@@ -557,7 +572,7 @@ public class FileContext {
    * @return the umask of this FileContext
    */
   public FsPermission getUMask() {
-    return umask;
+    return FsPermission.getUMask(conf);
   }
   
   /**
@@ -565,7 +580,7 @@ public class FileContext {
    * @param newUmask  the new umask
    */
   public void setUMask(final FsPermission newUmask) {
-    umask = newUmask;
+    FsPermission.setUMask(conf, newUmask);
   }
   
   
@@ -666,7 +681,7 @@ public class FileContext {
     CreateOpts.Perms permOpt = CreateOpts.getOpt(CreateOpts.Perms.class, opts);
     FsPermission permission = (permOpt != null) ? permOpt.getValue() :
                                       FILE_DEFAULT_PERM;
-    permission = permission.applyUMask(umask);
+    permission = FsCreateModes.applyUMask(permission, getUMask());
 
     final CreateOpts[] updatedOpts = 
                       CreateOpts.setOpt(CreateOpts.perms(permission), opts);
@@ -712,8 +727,9 @@ public class FileContext {
       ParentNotDirectoryException, UnsupportedFileSystemException, 
       IOException {
     final Path absDir = fixRelativePart(dir);
-    final FsPermission absFerms = (permission == null ? 
-          FsPermission.getDirDefault() : permission).applyUMask(umask);
+    final FsPermission absFerms = FsCreateModes.applyUMask(
+        permission == null ?
+            FsPermission.getDirDefault() : permission, getUMask());
     new FSLinkResolver<Void>() {
       @Override
       public Void next(final AbstractFileSystem fs, final Path p) 
@@ -754,7 +770,7 @@ public class FileContext {
       @Override
       public Boolean next(final AbstractFileSystem fs, final Path p) 
         throws IOException, UnresolvedLinkException {
-        return Boolean.valueOf(fs.delete(p, recursive));
+        return fs.delete(p, recursive);
       }
     }.resolve(this, absF);
   }
@@ -888,7 +904,7 @@ public class FileContext {
       @Override
       public Boolean next(final AbstractFileSystem fs, final Path p) 
         throws IOException, UnresolvedLinkException {
-        return Boolean.valueOf(fs.setReplication(p, replication));
+        return fs.setReplication(p, replication);
       }
     }.resolve(this, absF);
   }
@@ -1277,7 +1293,36 @@ public class FileContext {
    *
    * This call is most helpful with DFS, where it returns 
    * hostnames of machines that contain the given file.
-   * 
+   *
+   * In HDFS, if file is three-replicated, the returned array contains
+   * elements like:
+   * <pre>
+   * BlockLocation(offset: 0, length: BLOCK_SIZE,
+   *   hosts: {"host1:9866", "host2:9866, host3:9866"})
+   * BlockLocation(offset: BLOCK_SIZE, length: BLOCK_SIZE,
+   *   hosts: {"host2:9866", "host3:9866, host4:9866"})
+   * </pre>
+   *
+   * And if a file is erasure-coded, the returned BlockLocation are logical
+   * block groups.
+   *
+   * Suppose we have a RS_3_2 coded file (3 data units and 2 parity units).
+   * 1. If the file size is less than one stripe size, say 2 * CELL_SIZE, then
+   * there will be one BlockLocation returned, with 0 offset, actual file size
+   * and 4 hosts (2 data blocks and 2 parity blocks) hosting the actual blocks.
+   * 3. If the file size is less than one group size but greater than one
+   * stripe size, then there will be one BlockLocation returned, with 0 offset,
+   * actual file size with 5 hosts (3 data blocks and 2 parity blocks) hosting
+   * the actual blocks.
+   * 4. If the file size is greater than one group size, 3 * BLOCK_SIZE + 123
+   * for example, then the result will be like:
+   * <pre>
+   * BlockLocation(offset: 0, length: 3 * BLOCK_SIZE, hosts: {"host1:9866",
+   *   "host2:9866","host3:9866","host4:9866","host5:9866"})
+   * BlockLocation(offset: 3 * BLOCK_SIZE, length: 123, hosts: {"host1:9866",
+   *   "host4:9866", "host5:9866"})
+   * </pre>
+   *
    * @param f - get blocklocations of this file
    * @param start position (byte offset)
    * @param len (in bytes)
@@ -1511,7 +1556,7 @@ public class FileContext {
    * Return the file's status and block locations If the path is a file.
    * 
    * If a returned status is a file, it contains the file's block locations.
-   * 
+   *
    * @param f is the path
    *
    * @return an iterator that traverses statuses of the files/directories 
@@ -2689,6 +2734,42 @@ public class FileContext {
   }
 
   /**
+   * Unset the storage policy set for a given file or directory.
+   * @param src file or directory path.
+   * @throws IOException
+   */
+  public void unsetStoragePolicy(final Path src) throws IOException {
+    final Path absF = fixRelativePart(src);
+    new FSLinkResolver<Void>() {
+      @Override
+      public Void next(final AbstractFileSystem fs, final Path p)
+          throws IOException {
+        fs.unsetStoragePolicy(src);
+        return null;
+      }
+    }.resolve(this, absF);
+  }
+
+  /**
+   * Query the effective storage policy ID for the given file or directory.
+   *
+   * @param path file or directory path.
+   * @return storage policy for give file.
+   * @throws IOException
+   */
+  public BlockStoragePolicySpi getStoragePolicy(Path path) throws IOException {
+    final Path absF = fixRelativePart(path);
+    return new FSLinkResolver<BlockStoragePolicySpi>() {
+      @Override
+      public BlockStoragePolicySpi next(final AbstractFileSystem fs,
+          final Path p)
+          throws IOException {
+        return fs.getStoragePolicy(p);
+      }
+    }.resolve(this, absF);
+  }
+
+  /**
    * Retrieve all the storage policies supported by this file system.
    *
    * @return all storage policies supported by this filesystem.
@@ -2697,5 +2778,9 @@ public class FileContext {
   public Collection<? extends BlockStoragePolicySpi> getAllStoragePolicies()
       throws IOException {
     return defaultFS.getAllStoragePolicies();
+  }
+
+  Tracer getTracer() {
+    return tracer;
   }
 }

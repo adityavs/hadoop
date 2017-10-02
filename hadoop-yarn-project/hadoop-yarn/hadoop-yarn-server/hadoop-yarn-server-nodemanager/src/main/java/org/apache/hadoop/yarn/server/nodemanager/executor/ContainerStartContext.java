@@ -25,7 +25,9 @@ import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.container.Container;
 
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Encapsulates information required for starting/launching containers.
@@ -35,6 +37,7 @@ import java.util.List;
 @InterfaceStability.Unstable
 public final class ContainerStartContext {
   private final Container container;
+  private final Map<Path, List<String>> localizedResources;
   private final Path nmPrivateContainerScriptPath;
   private final Path nmPrivateTokensPath;
   private final String user;
@@ -42,9 +45,14 @@ public final class ContainerStartContext {
   private final Path containerWorkDir;
   private final List<String> localDirs;
   private final List<String> logDirs;
+  private final List<String> filecacheDirs;
+  private final List<String> userLocalDirs;
+  private final List<String> containerLocalDirs;
+  private final List<String> containerLogDirs;
 
   public static final class Builder {
     private Container container;
+    private Map<Path, List<String>> localizedResources;
     private Path nmPrivateContainerScriptPath;
     private Path nmPrivateTokensPath;
     private String user;
@@ -52,12 +60,22 @@ public final class ContainerStartContext {
     private Path containerWorkDir;
     private List<String> localDirs;
     private List<String> logDirs;
+    private List<String> filecacheDirs;
+    private List<String> userLocalDirs;
+    private List<String> containerLocalDirs;
+    private List<String> containerLogDirs;
 
     public Builder() {
     }
 
     public Builder setContainer(Container container) {
       this.container = container;
+      return this;
+    }
+
+    public Builder setLocalizedResources(Map<Path,
+        List<String>> localizedResources) {
+      this.localizedResources = localizedResources;
       return this;
     }
 
@@ -97,6 +115,26 @@ public final class ContainerStartContext {
       return this;
     }
 
+    public Builder setFilecacheDirs(List<String> filecacheDirs) {
+      this.filecacheDirs = filecacheDirs;
+      return this;
+    }
+
+    public Builder setUserLocalDirs(List<String> userLocalDirs) {
+      this.userLocalDirs = userLocalDirs;
+      return this;
+    }
+
+    public Builder setContainerLocalDirs(List<String> containerLocalDirs) {
+      this.containerLocalDirs = containerLocalDirs;
+      return this;
+    }
+
+    public Builder setContainerLogDirs(List<String> containerLogDirs) {
+      this.containerLogDirs = containerLogDirs;
+      return this;
+    }
+
     public ContainerStartContext build() {
       return new ContainerStartContext(this);
     }
@@ -104,6 +142,7 @@ public final class ContainerStartContext {
 
   private ContainerStartContext(Builder builder) {
     this.container = builder.container;
+    this.localizedResources = builder.localizedResources;
     this.nmPrivateContainerScriptPath = builder.nmPrivateContainerScriptPath;
     this.nmPrivateTokensPath = builder.nmPrivateTokensPath;
     this.user = builder.user;
@@ -111,10 +150,22 @@ public final class ContainerStartContext {
     this.containerWorkDir = builder.containerWorkDir;
     this.localDirs = builder.localDirs;
     this.logDirs = builder.logDirs;
+    this.filecacheDirs = builder.filecacheDirs;
+    this.userLocalDirs = builder.userLocalDirs;
+    this.containerLocalDirs = builder.containerLocalDirs;
+    this.containerLogDirs = builder.containerLogDirs;
   }
 
   public Container getContainer() {
     return this.container;
+  }
+
+  public Map<Path, List<String>> getLocalizedResources() {
+    if (this.localizedResources != null) {
+      return Collections.unmodifiableMap(this.localizedResources);
+    } else {
+      return null;
+    }
   }
 
   public Path getNmPrivateContainerScriptPath() {
@@ -138,10 +189,27 @@ public final class ContainerStartContext {
   }
 
   public List<String> getLocalDirs() {
-    return this.localDirs;
+    return Collections.unmodifiableList(this.localDirs);
   }
 
   public List<String> getLogDirs() {
-    return this.logDirs;
+    return Collections.unmodifiableList(this.logDirs);
+  }
+
+  public List<String> getFilecacheDirs() {
+    return Collections.unmodifiableList(this.filecacheDirs);
+  }
+
+  public List<String> getUserLocalDirs() {
+    return Collections.unmodifiableList(this.userLocalDirs);
+  }
+
+  public List<String> getContainerLocalDirs() {
+    return Collections.unmodifiableList(this.containerLocalDirs);
+  }
+
+  public List<String> getContainerLogDirs() {
+    return Collections.unmodifiableList(this
+        .containerLogDirs);
   }
 }

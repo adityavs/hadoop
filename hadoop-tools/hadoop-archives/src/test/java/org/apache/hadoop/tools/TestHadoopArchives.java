@@ -21,7 +21,6 @@ package org.apache.hadoop.tools;
 import java.io.ByteArrayOutputStream;
 import java.io.FilterInputStream;
 import java.io.IOException;
-import java.io.OutputStream;
 import java.io.PrintStream;
 import java.net.URI;
 import java.util.ArrayList;
@@ -29,8 +28,6 @@ import java.util.Collections;
 import java.util.List;
 import java.util.StringTokenizer;
 
-import org.apache.commons.logging.LogFactory;
-import org.apache.commons.logging.impl.Log4JLogger;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
@@ -39,18 +36,23 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.FsShell;
 import org.apache.hadoop.fs.HarFileSystem;
 import org.apache.hadoop.fs.LocalFileSystem;
+import org.apache.hadoop.fs.LocatedFileStatus;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.RemoteIterator;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
 import org.apache.hadoop.io.IOUtils;
+import org.apache.hadoop.test.GenericTestUtils;
 import org.apache.hadoop.util.JarFinder;
 import org.apache.hadoop.util.ToolRunner;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerConfiguration;
-import org.apache.log4j.Level;
 import org.junit.After;
 import org.junit.Assert;
 import static org.junit.Assert.*;
+import static org.slf4j.LoggerFactory.getLogger;
+
 import org.junit.Before;
 import org.junit.Test;
+import org.slf4j.event.Level;
 
 /**
  * test {@link HadoopArchives}
@@ -61,9 +63,8 @@ public class TestHadoopArchives {
       .getJar(HadoopArchives.class);
 
   {
-    ((Log4JLogger) LogFactory.getLog(org.apache.hadoop.security.Groups.class))
-        .getLogger().setLevel(Level.ERROR);
-
+    GenericTestUtils.setLogLevel(
+        getLogger(org.apache.hadoop.security.Groups.class), Level.ERROR);
   }
 
   private static final String inputDir = "input";
@@ -110,13 +111,9 @@ public class TestHadoopArchives {
     conf.set(CapacitySchedulerConfiguration.PREFIX
         + CapacitySchedulerConfiguration.ROOT + ".default."
         + CapacitySchedulerConfiguration.CAPACITY, "100");
-    dfscluster = new MiniDFSCluster
-      .Builder(conf)
-      .checkExitOnShutdown(true)
-      .numDataNodes(2)
-      .format(true)
-      .racks(null)
-      .build();
+    dfscluster =
+        new MiniDFSCluster.Builder(conf).checkExitOnShutdown(true)
+            .numDataNodes(3).format(true).racks(null).build();
 
     fs = dfscluster.getFileSystem();
     
@@ -447,7 +444,7 @@ public class TestHadoopArchives {
       int read; 
       while (true) {
         read = fsdis.read(buffer, readIntoBuffer, buffer.length - readIntoBuffer);
-        if (read < 0) {
+        if (read <= 0) {
           // end of stream:
           if (readIntoBuffer > 0) {
             baos.write(buffer, 0, readIntoBuffer);
@@ -753,12 +750,21 @@ public class TestHadoopArchives {
 
     final String harName = "foo.har";
     final String fullHarPathStr = prefix + harName;
-    final String[] args = { "-archiveName", harName, "-p", inputPathStr,
-        "-r 3", "*", archivePath.toString() };
+    final String[] args =
+        { "-archiveName", harName, "-p", inputPathStr, "-r", "2", "*",
+            archivePath.toString() };
     System.setProperty(HadoopArchives.TEST_HADOOP_ARCHIVES_JAR_PATH,
         HADOOP_ARCHIVES_JAR);
     final HadoopArchives har = new HadoopArchives(conf);
     assertEquals(0, ToolRunner.run(har, args));
+    RemoteIterator<LocatedFileStatus> listFiles =
+        fs.listFiles(new Path(archivePath.toString() + "/" + harName), false);
+    while (listFiles.hasNext()) {
+      LocatedFileStatus next = listFiles.next();
+      if (!next.getPath().toString().endsWith("_SUCCESS")) {
+        assertEquals(next.getPath().toString(), 2, next.getReplication());
+      }
+    }
     return fullHarPathStr;
   }
   
