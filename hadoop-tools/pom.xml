@@ -42,11 +42,13 @@
     <module>hadoop-pipes</module>
     <module>hadoop-openstack</module>
     <module>hadoop-sls</module>
+    <module>hadoop-resourceestimator</module>
     <module>hadoop-azure</module>
     <module>hadoop-aws</module>
     <module>hadoop-kafka</module>
     <module>hadoop-azure-datalake</module>
     <module>hadoop-aliyun</module>
+    <module>hadoop-fs2img</module>
   </modules>
 
   <build>

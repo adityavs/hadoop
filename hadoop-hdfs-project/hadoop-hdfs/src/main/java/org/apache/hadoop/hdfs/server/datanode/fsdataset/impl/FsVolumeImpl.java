@@ -51,7 +51,6 @@ import org.apache.hadoop.hdfs.server.datanode.BlockMetadataHeader;
 import org.apache.hadoop.hdfs.server.datanode.checker.VolumeCheckResult;
 import org.apache.hadoop.hdfs.server.datanode.fsdataset.DataNodeVolumeMetrics;
 import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsDatasetSpi;
-import org.apache.hadoop.util.AutoCloseableLock;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.DFSUtilClient;
 import org.apache.hadoop.hdfs.protocol.Block;
@@ -155,18 +154,24 @@ public class FsVolumeImpl implements FsVolumeSpi {
     this.reservedForReplicas = new AtomicLong(0L);
     this.storageLocation = sd.getStorageLocation();
     this.currentDir = sd.getCurrentDir();
-    File parent = currentDir.getParentFile();
-    this.usage = new DF(parent, conf);
     this.storageType = storageLocation.getStorageType();
     this.reserved = conf.getLong(DFSConfigKeys.DFS_DATANODE_DU_RESERVED_KEY
         + "." + StringUtils.toLowerCase(storageType.toString()), conf.getLong(
         DFSConfigKeys.DFS_DATANODE_DU_RESERVED_KEY,
         DFSConfigKeys.DFS_DATANODE_DU_RESERVED_DEFAULT));
     this.configuredCapacity = -1;
+    if (currentDir != null) {
+      File parent = currentDir.getParentFile();
+      this.usage = new DF(parent, conf);
+      cacheExecutor = initializeCacheExecutor(parent);
+      this.metrics = DataNodeVolumeMetrics.create(conf, parent.getPath());
+    } else {
+      this.usage = null;
+      cacheExecutor = null;
+      this.metrics = null;
+    }
     this.conf = conf;
     this.fileIoProvider = fileIoProvider;
-    cacheExecutor = initializeCacheExecutor(parent);
-    this.metrics = DataNodeVolumeMetrics.create(conf, getBaseURI().getPath());
   }
 
   protected ThreadPoolExecutor initializeCacheExecutor(File parent) {
@@ -342,43 +347,38 @@ public class FsVolumeImpl implements FsVolumeSpi {
 
   private void decDfsUsedAndNumBlocks(String bpid, long value,
                                       boolean blockFileDeleted) {
-    try(AutoCloseableLock lock = dataset.acquireDatasetLock()) {
-      BlockPoolSlice bp = bpSlices.get(bpid);
-      if (bp != null) {
-        bp.decDfsUsed(value);
-        if (blockFileDeleted) {
-          bp.decrNumBlocks();
-        }
+    // BlockPoolSlice map is thread safe, and update the space used or
+    // number of blocks are atomic operations, so it doesn't require to
+    // hold the dataset lock.
+    BlockPoolSlice bp = bpSlices.get(bpid);
+    if (bp != null) {
+      bp.decDfsUsed(value);
+      if (blockFileDeleted) {
+        bp.decrNumBlocks();
       }
     }
   }
 
   void incDfsUsedAndNumBlocks(String bpid, long value) {
-    try(AutoCloseableLock lock = dataset.acquireDatasetLock()) {
-      BlockPoolSlice bp = bpSlices.get(bpid);
-      if (bp != null) {
-        bp.incDfsUsed(value);
-        bp.incrNumBlocks();
-      }
+    BlockPoolSlice bp = bpSlices.get(bpid);
+    if (bp != null) {
+      bp.incDfsUsed(value);
+      bp.incrNumBlocks();
     }
   }
 
   void incDfsUsed(String bpid, long value) {
-    try(AutoCloseableLock lock = dataset.acquireDatasetLock()) {
-      BlockPoolSlice bp = bpSlices.get(bpid);
-      if (bp != null) {
-        bp.incDfsUsed(value);
-      }
+    BlockPoolSlice bp = bpSlices.get(bpid);
+    if (bp != null) {
+      bp.incDfsUsed(value);
     }
   }
 
   @VisibleForTesting
   public long getDfsUsed() throws IOException {
     long dfsUsed = 0;
-    try(AutoCloseableLock lock = dataset.acquireDatasetLock()) {
-      for(BlockPoolSlice s : bpSlices.values()) {
-        dfsUsed += s.getDfsUsed();
-      }
+    for(BlockPoolSlice s : bpSlices.values()) {
+      dfsUsed += s.getDfsUsed();
     }
     return dfsUsed;
   }
@@ -446,7 +446,8 @@ public class FsVolumeImpl implements FsVolumeSpi {
   /**
    * Unplanned Non-DFS usage, i.e. Extra usage beyond reserved.
    *
-   * @return
+   * @return Disk usage excluding space used by HDFS and excluding space
+   * reserved for blocks open for write.
    * @throws IOException
    */
   public long getNonDfsUsed() throws IOException {
@@ -524,7 +525,7 @@ public class FsVolumeImpl implements FsVolumeSpi {
   public String[] getBlockPoolList() {
     return bpSlices.keySet().toArray(new String[bpSlices.keySet().size()]);   
   }
-    
+
   /**
    * Temporary files. They get moved to the finalized block directory when
    * the block is finalized.

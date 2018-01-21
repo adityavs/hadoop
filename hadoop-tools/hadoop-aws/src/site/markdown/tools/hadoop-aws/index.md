@@ -1,4 +1,3 @@
-
 <!---
   Licensed under the Apache License, Version 2.0 (the "License");
   you may not use this file except in compliance with the License.
@@ -28,6 +27,9 @@ See also:
 * [Encryption](./encryption.html)
 * [S3Guard](./s3guard.html)
 * [Troubleshooting](./troubleshooting_s3a.html)
+* [Committing work to S3 with the "S3A Committers"](./committers.html)
+* [S3A Committers Architecture](./committer_architecture.html)
+* [Working with IAM Assumed Roles](./assumed_roles.html)
 * [Testing](./testing.html)
 
 ##<a name="overview"></a> Overview
@@ -82,7 +84,7 @@ the Hadoop project itself.
 1. Amazon EMR's `s3://` client. This is from the Amazon EMR team, who actively
 maintain it.
 1. Apache's Hadoop's [`s3n:` filesystem client](./s3n.html).
-   This connectore is no longer available: users must migrate to the newer `s3a:` client.
+   This connector is no longer available: users must migrate to the newer `s3a:` client.
 
 
 ##<a name="getting_started"></a> Getting Started
@@ -177,6 +179,7 @@ Parts of Hadoop relying on this can have unexpected behaviour. E.g. the
 `AggregatedLogDeletionService` of YARN will not remove the appropriate logfiles.
 * Directory listing can be slow. Use `listFiles(path, recursive)` for high
 performance recursive listings whenever possible.
+* It is possible to create files under files if the caller tries hard.
 * The time to rename a directory is proportional to the number of files
 underneath it (directory or indirectly) and the size of the files. (The copyis
 executed inside the S3 storage, so the time is independent of the bandwidth
@@ -184,8 +187,13 @@ from client to S3).
 * Directory renames are not atomic: they can fail partway through, and callers
 cannot safely rely on atomic renames as part of a commit algorithm.
 * Directory deletion is not atomic and can fail partway through.
-* It is possible to create files under files if the caller tries hard.
 
+The final three issues surface when using S3 as the immediate destination
+of work, as opposed to HDFS or other "real" filesystem.
+
+The [S3A committers](./committers.html) are the sole mechanism available
+to safely save the output of queries directly into S3 object stores
+through the S3A filesystem.
 
 
 ### Warning #3: Object stores have differerent authorization models
@@ -223,18 +231,6 @@ Do not inadvertently share these credentials through means such as
 
 If you do any of these: change your credentials immediately!
 
-### Warning #5: The S3A client cannot be used on Amazon EMR
-
-On Amazon EMR `s3a://` URLs are not supported; Amazon provide
-their own filesystem client, `s3://`.
-If you are using Amazon EMR, follow their instructions for use —and be aware
-that all issues related to S3 integration in EMR can only be addressed by Amazon
-themselves: please raise your issues with them.
-
-Equally importantly: much of this document does not apply to the EMR `s3://` client.
-Pleae consult
-[the EMR storage documentation](http://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-plan-file-systems.html)
-instead.
 
 ## <a name="authenticating"></a> Authenticating with S3
 
@@ -495,16 +491,56 @@ This means that the default S3A authentication chain can be defined as
 </property>
 ```
 
-### <a name="auth_security"></a> Protecting the AWS Credentials
+## <a name="auth_security"></a> Protecting the AWS Credentials
 
-To protect the access/secret keys from prying eyes, it is recommended that you
-use either IAM role-based authentication (such as EC2 instance profile) or
-the credential provider framework securely storing them and accessing them
-through configuration. The following describes using the latter for AWS
-credentials in the S3A FileSystem.
+It is critical that you never share or leak your AWS credentials.
+Loss of credentials can leak/lose all your data, run up large bills,
+and significantly damage your organisation.
 
+1. Never share your secrets.
 
-## <a name="credential_providers"></a>Storing secrets with Hadoop Credential Providers
+1. Never commit your secrets into an SCM repository.
+The [git secrets](https://github.com/awslabs/git-secrets) can help here.
+
+1. Avoid using s3a URLs which have key and secret in the URL. This
+is dangerous as the secrets leak into the logs.
+
+1. Never include AWS credentials in bug reports, files attached to them,
+or similar.
+
+1. If you use the `AWS_` environment variables,  your list of environment variables
+is equally sensitive.
+
+1. Never use root credentials.
+Use IAM user accounts, with each user/application having its own set of credentials.
+
+1. Use IAM permissions to restrict the permissions individual users and applications
+have. This is best done through roles, rather than configuring individual users.
+
+1. Avoid passing in secrets to Hadoop applications/commands on the command line.
+The command line of any launched program is visible to all users on a Unix system
+(via `ps`), and preserved in command histories.
+
+1. Explore using [IAM Assumed Roles](assumed_roles.html) for role-based permissions
+management: a specific S3A connection can be made with a different assumed role
+and permissions from the primary user account.
+
+1. Consider a workflow in which usera and applications are issued with short-lived
+session credentials, configuring S3A to use these through
+the `TemporaryAWSCredentialsProvider`.
+
+1. Have a secure process in place for cancelling and re-issuing credentials for
+users and applications. Test it regularly by using it to refresh credentials.
+
+When running in EC2, the IAM EC2 instance credential provider will automatically
+obtain the credentials needed to access AWS services in the role the EC2 VM
+was deployed as.
+This credential provider is enabled in S3A by default.
+
+The safest way to keep the AWS login keys a secret within Hadoop is to use
+Hadoop Credentials.
+
+## <a name="hadoop_credential_providers"></a>Storing secrets with Hadoop Credential Providers
 
 The Hadoop Credential Provider Framework allows secure "Credential Providers"
 to keep secrets outside Hadoop configuration files, storing them in encrypted
@@ -616,7 +652,7 @@ Because the provider path is not itself a sensitive secret, there is no risk
 from placing its declaration on the command line.
 
 
-## <a name="general_configuration"></a>Genaral S3A Client configuration
+## <a name="general_configuration"></a>General S3A Client configuration
 
 All S3A client options are configured with options with the prefix `fs.s3a.`.
 
@@ -875,6 +911,166 @@ options are covered in [Testing](./testing.md).
 </property>
 ```
 
+## <a name="retry_and_recovery"></a>Retry and Recovery
+
+The S3A client makes a best-effort attempt at recovering from network failures;
+this section covers the details of what it does.
+
+The S3A divides exceptions returned by the AWS SDK into different categories,
+and chooses a differnt retry policy based on their type and whether or
+not the failing operation is idempotent.
+
+
+### Unrecoverable Problems: Fail Fast
+
+* No object/bucket store: `FileNotFoundException`
+* No access permissions: `AccessDeniedException`
+* Network errors considered unrecoverable (`UnknownHostException`,
+ `NoRouteToHostException`, `AWSRedirectException`).
+* Interruptions: `InterruptedIOException`, `InterruptedException`.
+* Rejected HTTP requests: `InvalidRequestException`
+
+These are all considered unrecoverable: S3A will make no attempt to recover
+from them.
+
+### Possibly Recoverable Problems: Retry
+
+* Connection timeout: `ConnectTimeoutException`. Timeout before
+setting up a connection to the S3 endpoint (or proxy).
+* HTTP response status code 400, "Bad Request"
+
+The status code 400, Bad Request usually means that the request
+is unrecoverable; it's the generic "No" response. Very rarely it
+does recover, which is why it is in this category, rather than that
+of unrecoverable failures.
+
+These failures will be retried with a fixed sleep interval set in
+`fs.s3a.retry.interval`, up to the limit set in `fs.s3a.retry.limit`.
+
+
+### Only retrible on idempotent operations
+
+Some network failures are considered to be retriable if they occur on
+idempotent operations; there's no way to know if they happened
+after the request was processed by S3.
+
+* `SocketTimeoutException`: general network failure.
+* `EOFException` : the connection was broken while reading data
+* "No response from Server" (443, 444) HTTP responses.
+* Any other AWS client, service or S3 exception.
+
+These failures will be retried with a fixed sleep interval set in
+`fs.s3a.retry.interval`, up to the limit set in `fs.s3a.retry.limit`.
+
+*Important*: DELETE is considered idempotent, hence: `FileSystem.delete()`
+and `FileSystem.rename()` will retry their delete requests on any
+of these failures.
+
+The issue of whether delete should be idempotent has been a source
+of historical controversy in Hadoop.
+
+1. In the absence of any other changes to the object store, a repeated
+DELETE request will eventually result in the named object being deleted;
+it's a no-op if reprocessed. As indeed, is `Filesystem.delete()`.
+1. If another client creates a file under the path, it will be deleted.
+1. Any filesystem supporting an atomic `FileSystem.create(path, overwrite=false)`
+operation to reject file creation if the path exists MUST NOT consider
+delete to be idempotent, because a `create(path, false)` operation will
+only succeed if the first `delete()` call has already succeded.
+1. And a second, retried `delete()` call could delete the new data.
+
+Because S3 is eventially consistent *and* doesn't support an
+atomic create-no-overwrite operation, the choice is more ambigious.
+
+Currently S3A considers delete to be
+idempotent because it is convenient for many workflows, including the
+commit protocols. Just be aware that in the presence of transient failures,
+more things may be deleted than expected. (For anyone who considers this to
+be the wrong decision: rebuild the `hadoop-aws` module with the constant
+`S3AFileSystem.DELETE_CONSIDERED_IDEMPOTENT` set to `false`).
+
+
+
+
+
+
+### Throttled requests from S3 and Dynamo DB
+
+
+When S3A or Dynamo DB returns a response indicating that requests
+from the caller are being throttled, an exponential back-off with
+an initial interval and a maximum number of requests.
+
+```xml
+<property>
+  <name>fs.s3a.retry.throttle.limit</name>
+  <value>${fs.s3a.attempts.maximum}</value>
+  <description>
+    Number of times to retry any throttled request.
+  </description>
+</property>
+
+<property>
+  <name>fs.s3a.retry.throttle.interval</name>
+  <value>1000ms</value>
+  <description>
+    Interval between retry attempts on throttled requests.
+  </description>
+</property>
+```
+
+Notes
+
+1. There is also throttling taking place inside the AWS SDK; this is managed
+by the value `fs.s3a.attempts.maximum`.
+1. Throttling events are tracked in the S3A filesystem metrics and statistics.
+1. Amazon KMS may thottle a customer based on the total rate of uses of
+KMS *across all user accounts and applications*.
+
+Throttling of S3 requests is all too common; it is caused by too many clients
+trying to access the same shard of S3 Storage. This generatlly
+happen if there are too many reads, those being the most common in Hadoop
+applications. This problem is exacerbated by Hive's partitioning
+strategy used when storing data, such as partitioning by year and then month.
+This results in paths with little or no variation at their start, which ends
+up in all the data being stored in the same shard(s).
+
+Here are some expensive operations; the more of these taking place
+against part of an S3 bucket, the more load it experiences.
+* Many clients trying to list directories or calling `getFileStatus` on
+paths (LIST and HEAD requests respectively)
+* The GET requests issued when reading data.
+* Random IO used when reading columnar data (ORC, Parquet) means that many
+more GET requests than a simple one-per-file read.
+* The number of active writes to that part of the S3 bucket.
+
+A special case is when enough data has been written into part of an S3 bucket
+that S3 decides to split the data across more than one shard: this
+is believed to be one by some copy operation which can take some time.
+While this is under way, S3 clients access data under these paths will
+be throttled more than usual.
+
+
+Mitigation strategies
+
+1. Use separate buckets for intermediate data/different applications/roles.
+1. Use significantly different paths for different datasets in the same bucket.
+1. Increase the value of `fs.s3a.retry.throttle.interval` to provide
+longer delays between attempts.
+1. Reduce the parallelism of the queries. The more tasks trying to access
+data in parallel, the more load.
+1. Reduce `fs.s3a.threads.max` to reduce the amount of parallel operations
+performed by clients.
+!. Maybe: increase `fs.s3a.readahead.range` to increase the minimum amount
+of data asked for in every GET request, as well as how much data is
+skipped in the existing stream before aborting it and creating a new stream.
+1. If the DynamoDB tables used by S3Guard are being throttled, increase
+the capacity through `hadoop s3guard set-capacity` (and pay more, obviously).
+1. KMS: "consult AWS about increating your capacity".
+
+
+
+
 ## <a name="per_bucket_configuration"></a>Configuring different S3 buckets with Per-Bucket Configuration
 
 Different S3 buckets can be accessed with different S3A client configurations.
@@ -1081,7 +1277,7 @@ The original S3A client implemented file writes by
 buffering all data to disk as it was written to the `OutputStream`.
 Only when the stream's `close()` method was called would the upload start.
 
-This can made output slow, especially on large uploads, and could even
+This made output slow, especially on large uploads, and could even
 fill up the disk space of small (virtual) disks.
 
 Hadoop 2.7 added the `S3AFastOutputStream` alternative, which Hadoop 2.8 expanded.
@@ -1335,8 +1531,13 @@ from VMs running on EC2.
 </property>
 ```
 
-### <a name="multipart_purge"></a>Cleaning up after partial Upload Failures: `fs.s3a.multipart.purge`
+### <a name="multipart_purge"></a>Cleaning up after partial Upload Failures
 
+There are two mechanisms for cleaning up after leftover multipart
+uploads:
+- Hadoop s3guard CLI commands for listing and deleting uploads by their
+age. Doumented in the [S3Guard](./s3guard.html) section.
+- The configuration parameter `fs.s3a.multipart.purge`, covered below.
 
 If an large stream writeoperation is interrupted, there may be
 intermediate partitions uploaded to S3 —data which will be billed for.
@@ -1393,7 +1594,18 @@ backward seeks.
 
 *"normal" (default)*
 
-This is currently the same as "sequential", though it may evolve in future.
+The "Normal" policy starts off reading a file  in "sequential" mode,
+but if the caller seeks backwards in the stream, it switches from
+sequential to "random".
+
+This policy effectively recognizes the initial read pattern of columnar
+storage formats (e.g. Apache ORC and Apache Parquet), which seek to the end
+of a file, read in index data and then seek backwards to selectively read
+columns. The first seeks may be be expensive compared to the random policy,
+however the overall process is much less expensive than either sequentially
+reading through a file with the "random" policy, or reading columnar data
+with the "sequential" policy. When the exact format/recommended
+seek policy of data are known in advance, this policy
 
 *"random"*
 
@@ -1443,6 +1655,43 @@ basis.
 to set fadvise policies on input streams. Once implemented,
 this will become the supported mechanism used for configuring the input IO policy.
 
+##<a name="metrics"></a>Metrics
+
+S3A metrics can be monitored through Hadoop's metrics2 framework. S3A creates
+its own metrics system called s3a-file-system, and each instance of the client
+will create its own metrics source, named with a JVM-unique numerical ID.
+
+As a simple example, the following can be added to `hadoop-metrics2.properties`
+to write all S3A metrics to a log file every 10 seconds:
+
+    s3a-file-system.sink.my-metrics-config.class=org.apache.hadoop.metrics2.sink.FileSink
+    s3a-file-system.sink.my-metrics-config.filename=/var/log/hadoop-yarn/s3a-metrics.out
+    *.period=10
+
+Lines in that file will be structured like the following:
+
+    1511208770680 s3aFileSystem.s3aFileSystem: Context=s3aFileSystem, s3aFileSystemId=892b02bb-7b30-4ffe-80ca-3a9935e1d96e, bucket=bucket,
+    Hostname=hostname-1.hadoop.apache.com, files_created=1, files_copied=2, files_copied_bytes=10000, files_deleted=5, fake_directories_deleted=3,
+    directories_created=3, directories_deleted=0, ignored_errors=0, op_copy_from_local_file=0, op_exists=0, op_get_file_status=15, op_glob_status=0,
+    op_is_directory=0, op_is_file=0, op_list_files=0, op_list_located_status=0, op_list_status=3, op_mkdirs=1, op_rename=2, object_copy_requests=0,
+    object_delete_requests=6, object_list_requests=23, object_continue_list_requests=0, object_metadata_requests=46, object_multipart_aborted=0,
+    object_put_bytes=0, object_put_requests=4, object_put_requests_completed=4, stream_write_failures=0, stream_write_block_uploads=0,
+    stream_write_block_uploads_committed=0, stream_write_block_uploads_aborted=0, stream_write_total_time=0, stream_write_total_data=0,
+    s3guard_metadatastore_put_path_request=10, s3guard_metadatastore_initialization=0, object_put_requests_active=0, object_put_bytes_pending=0,
+    stream_write_block_uploads_active=0, stream_write_block_uploads_pending=0, stream_write_block_uploads_data_pending=0,
+    S3guard_metadatastore_put_path_latencyNumOps=0, S3guard_metadatastore_put_path_latency50thPercentileLatency=0,
+    S3guard_metadatastore_put_path_latency75thPercentileLatency=0, S3guard_metadatastore_put_path_latency90thPercentileLatency=0,
+    S3guard_metadatastore_put_path_latency95thPercentileLatency=0, S3guard_metadatastore_put_path_latency99thPercentileLatency=0
+
+Depending on other configuration, metrics from other systems, contexts, etc. may
+also get recorded, for example the following:
+
+    1511208770680 metricssystem.MetricsSystem: Context=metricssystem, Hostname=s3a-metrics-4.gce.cloudera.com, NumActiveSources=1, NumAllSources=1,
+    NumActiveSinks=1, NumAllSinks=0, Sink_fileNumOps=2, Sink_fileAvgTime=1.0, Sink_fileDropped=0, Sink_fileQsize=0, SnapshotNumOps=5,
+    SnapshotAvgTime=0.0, PublishNumOps=2, PublishAvgTime=0.0, DroppedPubAll=0
+
+Note that low-level metrics from the AWS SDK itself are not currently included
+in these metrics.
 
 ##<a name="further_reading"></a> Other Topics
 

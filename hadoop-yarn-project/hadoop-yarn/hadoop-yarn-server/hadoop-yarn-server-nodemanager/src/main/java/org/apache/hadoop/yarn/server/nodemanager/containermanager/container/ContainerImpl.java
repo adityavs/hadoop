@@ -34,6 +34,7 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
+import org.apache.commons.lang.StringUtils;
 import org.apache.hadoop.yarn.api.records.ContainerSubState;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.scheduler.UpdateContainerSchedulerEvent;
 import org.slf4j.Logger;
@@ -60,13 +61,16 @@ import org.apache.hadoop.yarn.security.ContainerTokenIdentifier;
 import org.apache.hadoop.yarn.server.api.protocolrecords.NMContainerStatus;
 import org.apache.hadoop.yarn.server.nodemanager.ContainerExecutor.ExitCode;
 import org.apache.hadoop.yarn.server.nodemanager.Context;
+import org.apache.hadoop.yarn.server.nodemanager.DeletionService;
 import org.apache.hadoop.yarn.server.nodemanager.NMAuditLogger;
 import org.apache.hadoop.yarn.server.nodemanager.NMAuditLogger.AuditConstants;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.AuxServicesEvent;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.AuxServicesEventType;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.application.ApplicationContainerFinishedEvent;
+import org.apache.hadoop.yarn.server.nodemanager.containermanager.deletion.task.DockerContainerDeletionTask;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.launcher.ContainersLauncherEvent;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.launcher.ContainersLauncherEventType;
+import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime.DockerLinuxContainerRuntime;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.localizer.LocalResourceRequest;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.localizer.ResourceSet;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.localizer.event.ContainerLocalizationCleanupEvent;
@@ -362,6 +366,9 @@ public class ContainerImpl implements Container {
     // From SCHEDULED State
     .addTransition(ContainerState.SCHEDULED, ContainerState.RUNNING,
         ContainerEventType.CONTAINER_LAUNCHED, new LaunchTransition())
+    .addTransition(ContainerState.SCHEDULED, ContainerState.PAUSED,
+        ContainerEventType.RECOVER_PAUSED_CONTAINER,
+        new RecoveredContainerTransition())
     .addTransition(ContainerState.SCHEDULED, ContainerState.EXITED_WITH_FAILURE,
         ContainerEventType.CONTAINER_EXITED_WITH_FAILURE,
         new ExitedWithFailureTransition(true))
@@ -828,7 +835,8 @@ public class ContainerImpl implements Container {
       ContainerStatus status = BuilderUtils.newContainerStatus(this.containerId,
           getCurrentState(), diagnostics.toString(), exitCode, getResource(),
           this.containerTokenIdentifier.getExecutionType());
-      status.setIPs(ips == null ? null : Arrays.asList(ips.split(",")));
+      status.setIPs(StringUtils.isEmpty(ips) ? null :
+          Arrays.asList(ips.split(",")));
       status.setHost(host);
       status.setContainerSubState(getContainerSubState());
       return status;
@@ -841,12 +849,14 @@ public class ContainerImpl implements Container {
   public NMContainerStatus getNMContainerStatus() {
     this.readLock.lock();
     try {
-      return NMContainerStatus.newInstance(this.containerId, this.version,
-          getCurrentState(), getResource(), diagnostics.toString(), exitCode,
+      return NMContainerStatus.newInstance(this.containerId,
+          this.version, getCurrentState(), getResource(),
+          diagnostics.toString(), exitCode,
           containerTokenIdentifier.getPriority(),
           containerTokenIdentifier.getCreationTime(),
           containerTokenIdentifier.getNodeLabelExpression(),
-          containerTokenIdentifier.getExecutionType());
+          containerTokenIdentifier.getExecutionType(),
+          containerTokenIdentifier.getAllocationRequestId());
     } finally {
       this.readLock.unlock();
     }
@@ -952,7 +962,10 @@ public class ContainerImpl implements Container {
       if (recoveredStatus == RecoveredContainerStatus.LAUNCHED) {
         // try to recover a container that was previously launched
         launcherEvent = ContainersLauncherEventType.RECOVER_CONTAINER;
+      } else if (recoveredStatus == RecoveredContainerStatus.PAUSED) {
+        launcherEvent = ContainersLauncherEventType.RECOVER_PAUSED_CONTAINER;
       }
+
       containerLaunchStartTime = clock.getTime();
       dispatcher.getEventHandler().handle(
           new ContainersLauncherEvent(this, launcherEvent));
@@ -963,9 +976,6 @@ public class ContainerImpl implements Container {
   @SuppressWarnings("unchecked") // dispatcher not typed
   private void sendScheduleEvent() {
     if (recoveredStatus == RecoveredContainerStatus.PAUSED) {
-      // Recovery is not supported for paused container so we raise the
-      // launch event which will proceed to kill the paused container instead
-      // of raising the schedule event.
       ContainersLauncherEventType launcherEvent;
       launcherEvent = ContainersLauncherEventType.RECOVER_PAUSED_CONTAINER;
       dispatcher.getEventHandler()
@@ -1060,17 +1070,15 @@ public class ContainerImpl implements Container {
       UpdateContainerTokenEvent updateEvent = (UpdateContainerTokenEvent)event;
       // Update the container token
       container.setContainerTokenIdentifier(updateEvent.getUpdatedToken());
-      if (updateEvent.isResourceChange()) {
-        try {
-          // Persist change in the state store.
-          container.context.getNMStateStore().storeContainerResourceChanged(
-              container.containerId,
-              container.getContainerTokenIdentifier().getVersion(),
-              container.getResource());
-        } catch (IOException e) {
-          LOG.warn("Could not store container [" + container.containerId
-              + "] resource change..", e);
-        }
+
+      try {
+        // Persist change in the state store.
+        container.context.getNMStateStore()
+            .storeContainerUpdateToken(container.containerId,
+                container.getContainerTokenIdentifier());
+      } catch (IOException e) {
+        LOG.warn("Could not store container [" + container.containerId
+            + "] update..", e);
       }
     }
   }
@@ -1115,6 +1123,8 @@ public class ContainerImpl implements Container {
       if (container.recoveredStatus == RecoveredContainerStatus.COMPLETED) {
         container.sendFinishedEvents();
         return ContainerState.DONE;
+      } else if (container.recoveredStatus == RecoveredContainerStatus.QUEUED) {
+        return ContainerState.SCHEDULED;
       } else if (container.recoveredAsKilled &&
           container.recoveredStatus == RecoveredContainerStatus.REQUESTED) {
         // container was killed but never launched
@@ -1474,6 +1484,18 @@ public class ContainerImpl implements Container {
   }
 
   /**
+   * Transition from SCHEDULED state to PAUSED state on recovery
+   */
+  static class RecoveredContainerTransition extends ContainerTransition {
+    @SuppressWarnings("unchecked")
+    @Override
+    public void transition(ContainerImpl container, ContainerEvent event) {
+      container.sendContainerMonitorStartEvent();
+      container.wasLaunched = true;
+    }
+  }
+
+  /**
    * Transition from RUNNING or KILLING state to
    * EXITED_WITH_SUCCESS state upon EXITED_WITH_SUCCESS message.
    */
@@ -1494,6 +1516,11 @@ public class ContainerImpl implements Container {
       container.exitCode = 0;
     	
       // TODO: Add containerWorkDir to the deletion service.
+
+      if (DockerLinuxContainerRuntime.isDockerContainerRequested(
+          container.getLaunchContext().getEnvironment())) {
+        removeDockerContainer(container);
+      }
 
       if (clCleanupRequired) {
         container.dispatcher.getEventHandler().handle(
@@ -1524,11 +1551,16 @@ public class ContainerImpl implements Container {
       ContainerExitEvent exitEvent = (ContainerExitEvent) event;
       container.exitCode = exitEvent.getExitCode();
       if (exitEvent.getDiagnosticInfo() != null) {
-        container.addDiagnostics(exitEvent.getDiagnosticInfo(), "\n");
+        container.addDiagnostics(exitEvent.getDiagnosticInfo() + "\n");
       }
 
       // TODO: Add containerWorkDir to the deletion service.
       // TODO: Add containerOuputDir to the deletion service.
+
+      if (DockerLinuxContainerRuntime.isDockerContainerRequested(
+          container.getLaunchContext().getEnvironment())) {
+        removeDockerContainer(container);
+      }
 
       if (clCleanupRequired) {
         container.dispatcher.getEventHandler().handle(
@@ -1561,7 +1593,7 @@ public class ContainerImpl implements Container {
           container.addDiagnostics("Diagnostic message from attempt "
               + n + " : ", "\n");
         }
-        container.addDiagnostics(exitEvent.getDiagnosticInfo(), "\n");
+        container.addDiagnostics(exitEvent.getDiagnosticInfo() + "\n");
       }
 
       if (container.shouldRetry(container.exitCode)) {
@@ -1720,7 +1752,7 @@ public class ContainerImpl implements Container {
 
       ContainerResourceFailedEvent rsrcFailedEvent =
           (ContainerResourceFailedEvent) event;
-      container.addDiagnostics(rsrcFailedEvent.getDiagnosticMessage(), "\n");
+      container.addDiagnostics(rsrcFailedEvent.getDiagnosticMessage() + "\n");
 
       // Inform the localizer to decrement reference counts and cleanup
       // resources.
@@ -1743,7 +1775,7 @@ public class ContainerImpl implements Container {
       container.metrics.endInitingContainer();
       ContainerKillEvent killEvent = (ContainerKillEvent) event;
       container.exitCode = killEvent.getContainerExitStatus();
-      container.addDiagnostics(killEvent.getDiagnostic(), "\n");
+      container.addDiagnostics(killEvent.getDiagnostic() + "\n");
       container.addDiagnostics("Container is killed before being launched.\n");
     }
   }
@@ -1782,7 +1814,7 @@ public class ContainerImpl implements Container {
           new ContainersLauncherEvent(container,
               ContainersLauncherEventType.CLEANUP_CONTAINER));
       ContainerKillEvent killEvent = (ContainerKillEvent) event;
-      container.addDiagnostics(killEvent.getDiagnostic(), "\n");
+      container.addDiagnostics(killEvent.getDiagnostic() + "\n");
       container.exitCode = killEvent.getContainerExitStatus();
     }
   }
@@ -1821,7 +1853,12 @@ public class ContainerImpl implements Container {
       }
 
       if (exitEvent.getDiagnosticInfo() != null) {
-        container.addDiagnostics(exitEvent.getDiagnosticInfo(), "\n");
+        container.addDiagnostics(exitEvent.getDiagnosticInfo() + "\n");
+      }
+
+      if (DockerLinuxContainerRuntime.isDockerContainerRequested(
+          container.getLaunchContext().getEnvironment())) {
+        removeDockerContainer(container);
       }
 
       // The process/process-grp is killed. Decrement reference counts and
@@ -1873,7 +1910,7 @@ public class ContainerImpl implements Container {
       } else {
         ContainerKillEvent killEvent = (ContainerKillEvent) event;
         container.exitCode = killEvent.getContainerExitStatus();
-        container.addDiagnostics(killEvent.getDiagnostic(), "\n");
+        container.addDiagnostics(killEvent.getDiagnostic() + "\n");
         container.addDiagnostics("Container is killed before being launched.\n");
         container.metrics.killedContainer();
         NMAuditLogger.logSuccess(container.user,
@@ -1993,7 +2030,7 @@ public class ContainerImpl implements Container {
     public void transition(ContainerImpl container, ContainerEvent event) {
       ContainerDiagnosticsUpdateEvent updateEvent =
           (ContainerDiagnosticsUpdateEvent) event;
-      container.addDiagnostics(updateEvent.getDiagnosticsUpdate(), "\n");
+      container.addDiagnostics(updateEvent.getDiagnosticsUpdate() + "\n");
     }
   }
 
@@ -2011,7 +2048,7 @@ public class ContainerImpl implements Container {
           new ContainersLauncherEvent(container,
               ContainersLauncherEventType.PAUSE_CONTAINER));
       ContainerPauseEvent pauseEvent = (ContainerPauseEvent) event;
-      container.addDiagnostics(pauseEvent.getDiagnostic(), "\n");
+      container.addDiagnostics(pauseEvent.getDiagnostic() + "\n");
     }
   }
 
@@ -2044,7 +2081,7 @@ public class ContainerImpl implements Container {
           new ContainersLauncherEvent(container,
               ContainersLauncherEventType.RESUME_CONTAINER));
       ContainerResumeEvent resumeEvent = (ContainerResumeEvent) event;
-      container.addDiagnostics(resumeEvent.getDiagnostic(), "\n");
+      container.addDiagnostics(resumeEvent.getDiagnostic() + "\n");
     }
   }
 
@@ -2160,5 +2197,13 @@ public class ContainerImpl implements Container {
   @Override
   public ResourceMappings getResourceMappings() {
     return resourceMappings;
+  }
+
+  private static void removeDockerContainer(ContainerImpl container) {
+    DeletionService deletionService = container.context.getDeletionService();
+    DockerContainerDeletionTask deletionTask =
+        new DockerContainerDeletionTask(deletionService, container.user,
+            container.getContainerId().toString());
+    deletionService.delete(deletionTask);
   }
 }

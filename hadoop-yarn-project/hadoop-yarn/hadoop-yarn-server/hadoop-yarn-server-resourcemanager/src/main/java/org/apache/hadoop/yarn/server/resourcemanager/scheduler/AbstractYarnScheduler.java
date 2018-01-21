@@ -58,7 +58,6 @@ import org.apache.hadoop.yarn.api.records.UpdateContainerRequest;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.exceptions.InvalidResourceRequestException;
 import org.apache.hadoop.yarn.exceptions.YarnException;
-import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
 import org.apache.hadoop.yarn.proto.YarnServiceProtos.SchedulerResourceTypes;
 import org.apache.hadoop.yarn.server.api.protocolrecords.NMContainerStatus;
 import org.apache.hadoop.yarn.server.resourcemanager.RMAppManagerEvent;
@@ -69,6 +68,7 @@ import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
 import org.apache.hadoop.yarn.server.resourcemanager.RMCriticalThreadUncaughtExceptionHandler;
 import org.apache.hadoop.yarn.server.resourcemanager.RMServerUtils;
 import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
+import org.apache.hadoop.yarn.server.resourcemanager.monitor.SchedulingMonitorManager;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEvent;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEventType;
@@ -86,6 +86,7 @@ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeFinishedContai
 import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeResourceUpdateEvent;
 import org.apache.hadoop.yarn.server.resourcemanager.rmnode.UpdatedContainerInfo;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.activities.ActivitiesManager;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.ContainerRequest;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.QueueEntitlement;
 
 
@@ -169,6 +170,9 @@ public abstract class AbstractYarnScheduler
   // the NM in the next heartbeat.
   private boolean autoUpdateContainers = false;
 
+  protected SchedulingMonitorManager schedulingMonitorManager =
+      new SchedulingMonitorManager();
+
   /**
    * Construct the service.
    *
@@ -208,8 +212,8 @@ public abstract class AbstractYarnScheduler
           new RMCriticalThreadUncaughtExceptionHandler(rmContext));
       updateThread.setDaemon(true);
     }
-
     super.serviceInit(conf);
+
   }
 
   @Override
@@ -217,6 +221,7 @@ public abstract class AbstractYarnScheduler
     if (updateThread != null) {
       updateThread.start();
     }
+    schedulingMonitorManager.startAll();
     super.serviceStart();
   }
 
@@ -226,12 +231,18 @@ public abstract class AbstractYarnScheduler
       updateThread.interrupt();
       updateThread.join(THREAD_JOIN_TIMEOUT_MS);
     }
+    schedulingMonitorManager.stop();
     super.serviceStop();
   }
 
   @VisibleForTesting
   public ClusterNodeTracker getNodeTracker() {
     return nodeTracker;
+  }
+
+  @VisibleForTesting
+  public SchedulingMonitorManager getSchedulingMonitorManager() {
+    return schedulingMonitorManager;
   }
 
   /*
@@ -243,17 +254,18 @@ public abstract class AbstractYarnScheduler
     ApplicationId appId = currentAttempt.getApplicationId();
     SchedulerApplication<T> app = applications.get(appId);
     List<Container> containerList = new ArrayList<Container>();
-    RMApp appImpl = this.rmContext.getRMApps().get(appId);
-    if (appImpl.getApplicationSubmissionContext().getUnmanagedAM()) {
-      return containerList;
-    }
     if (app == null) {
       return containerList;
     }
-    Collection<RMContainer> liveContainers =
-        app.getCurrentAppAttempt().getLiveContainers();
-    ContainerId amContainerId = rmContext.getRMApps().get(appId)
-        .getCurrentAppAttempt().getMasterContainer().getId();
+    Collection<RMContainer> liveContainers = app.getCurrentAppAttempt()
+        .pullContainersToTransfer();
+    ContainerId amContainerId = null;
+    // For UAM, amContainer would be null
+    if (rmContext.getRMApps().get(appId).getCurrentAppAttempt()
+        .getMasterContainer() != null) {
+      amContainerId = rmContext.getRMApps().get(appId).getCurrentAppAttempt()
+          .getMasterContainer().getId();
+    }
     for (RMContainer rmContainer : liveContainers) {
       if (!rmContainer.getContainerId().equals(amContainerId)) {
         containerList.add(rmContainer.getContainer());
@@ -444,7 +456,7 @@ public abstract class AbstractYarnScheduler
   }
 
   @Override
-  public void addQueue(Queue newQueue) throws YarnException {
+  public void addQueue(Queue newQueue) throws YarnException, IOException {
     throw new YarnException(getClass().getSimpleName()
         + " does not support this operation");
   }
@@ -571,6 +583,7 @@ public abstract class AbstractYarnScheduler
           status.getPriority(), null);
     container.setVersion(status.getVersion());
     container.setExecutionType(status.getExecutionType());
+    container.setAllocationRequestId(status.getAllocationRequestId());
     ApplicationAttemptId attemptId =
         container.getId().getApplicationAttemptId();
     RMContainer rmContainer = new RMContainerImpl(container,
@@ -587,10 +600,10 @@ public abstract class AbstractYarnScheduler
    * @param rmContainer rmContainer
    */
   private void recoverResourceRequestForContainer(RMContainer rmContainer) {
-    List<ResourceRequest> requests = rmContainer.getResourceRequests();
+    ContainerRequest containerRequest = rmContainer.getContainerRequest();
 
     // If container state is moved to ACQUIRED, request will be empty.
-    if (requests == null) {
+    if (containerRequest == null) {
       return;
     }
 
@@ -605,7 +618,7 @@ public abstract class AbstractYarnScheduler
     SchedulerApplicationAttempt schedulerAttempt =
         getCurrentAttemptForContainer(rmContainer.getContainerId());
     if (schedulerAttempt != null) {
-      schedulerAttempt.recoverResourceRequestsForContainer(requests);
+      schedulerAttempt.recoverResourceRequestsForContainer(containerRequest);
     }
   }
 
@@ -794,7 +807,7 @@ public abstract class AbstractYarnScheduler
       writeLock.unlock();
     }
   }
-  
+
   /**
    * Process resource update on a node.
    */
@@ -897,12 +910,12 @@ public abstract class AbstractYarnScheduler
     LOG.info("Updated the cluste max priority to maxClusterLevelAppPriority = "
         + maxClusterLevelAppPriority);
   }
-  
+
   /**
    * Sanity check increase/decrease request, and return
    * SchedulerContainerResourceChangeRequest according to given
    * UpdateContainerRequest.
-   * 
+   *
    * <pre>
    * - Returns non-null value means validation succeeded
    * - Throw exception when any other error happens
@@ -1327,71 +1340,46 @@ public abstract class AbstractYarnScheduler
   }
 
   /*
-   * Get a Resource object with for the minimum allocation possible. If resource
-   * profiles are enabled then the 'minimum' resource profile will be used. If
-   * they are not enabled, use the minimums specified in the config files.
+   * Get a Resource object with for the minimum allocation possible.
    *
    * @return a Resource object with the minimum allocation for the scheduler
    */
   public Resource getMinimumAllocation() {
-    boolean profilesEnabled = getConfig()
-        .getBoolean(YarnConfiguration.RM_RESOURCE_PROFILES_ENABLED,
-            YarnConfiguration.DEFAULT_RM_RESOURCE_PROFILES_ENABLED);
-    Resource ret;
-    if (!profilesEnabled) {
-      ret = ResourceUtils.getResourceTypesMinimumAllocation();
-    } else {
-      try {
-        ret = rmContext.getResourceProfilesManager().getMinimumProfile();
-      } catch (YarnException e) {
-        LOG.error(
-            "Exception while getting minimum profile from profile manager:", e);
-        throw new YarnRuntimeException(e);
-      }
-    }
+    Resource ret = ResourceUtils.getResourceTypesMinimumAllocation();
     LOG.info("Minimum allocation = " + ret);
     return ret;
   }
 
   /**
-   * Get a Resource object with for the maximum allocation possible. If resource
-   * profiles are enabled then the 'maximum' resource profile will be used. If
-   * they are not enabled, use the maximums specified in the config files.
+   * Get a Resource object with for the maximum allocation possible.
    *
    * @return a Resource object with the maximum allocation for the scheduler
    */
 
   public Resource getMaximumAllocation() {
-    boolean profilesEnabled = getConfig()
-        .getBoolean(YarnConfiguration.RM_RESOURCE_PROFILES_ENABLED,
-            YarnConfiguration.DEFAULT_RM_RESOURCE_PROFILES_ENABLED);
-    Resource ret;
-    if (!profilesEnabled) {
-      ret = ResourceUtils.getResourceTypesMaximumAllocation();
-    } else {
-      try {
-        ret = rmContext.getResourceProfilesManager().getMaximumProfile();
-      } catch (YarnException e) {
-        LOG.error(
-            "Exception while getting maximum profile from ResourceProfileManager:",
-            e);
-        throw new YarnRuntimeException(e);
-      }
-    }
+    Resource ret = ResourceUtils.getResourceTypesMaximumAllocation();
     LOG.info("Maximum allocation = " + ret);
     return ret;
   }
 
   @Override
   public long checkAndGetApplicationLifetime(String queueName, long lifetime) {
-    // -1 indicates, lifetime is not configured.
-    return -1;
+    // Lifetime is the application lifetime by default.
+    return lifetime;
   }
 
   @Override
   public long getMaximumApplicationLifetime(String queueName) {
     return -1;
   }
+
+  /**
+   * Kill a RMContainer. This is meant to be called in tests only to simulate
+   * AM container failures.
+   * @param container the container to kill
+   */
+  @VisibleForTesting
+  public abstract void killContainer(RMContainer container);
 
   /**
    * Update internal state of the scheduler.  This can be useful for scheduler
@@ -1437,6 +1425,17 @@ public abstract class AbstractYarnScheduler
   protected void triggerUpdate() {
     synchronized (updateThreadMonitor) {
       updateThreadMonitor.notify();
+    }
+  }
+
+  @Override
+  public void reinitialize(Configuration conf, RMContext rmContext)
+      throws IOException {
+    try {
+      LOG.info("Reinitializing SchedulingMonitorManager ...");
+      schedulingMonitorManager.reinitialize(rmContext, conf);
+    } catch (YarnException e) {
+      throw new IOException(e);
     }
   }
 }

@@ -17,25 +17,15 @@
 */
 package org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair;
 
-import java.io.File;
-import java.io.IOException;
-import java.net.URL;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-
-import javax.xml.parsers.DocumentBuilder;
-import javax.xml.parsers.DocumentBuilderFactory;
-import javax.xml.parsers.ParserConfigurationException;
-
+import com.google.common.annotations.VisibleForTesting;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience.Public;
 import org.apache.hadoop.classification.InterfaceStability.Unstable;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.UnsupportedFileSystemException;
 import org.apache.hadoop.security.authorize.AccessControlList;
 import org.apache.hadoop.service.AbstractService;
 import org.apache.hadoop.yarn.api.records.QueueACL;
@@ -45,8 +35,8 @@ import org.apache.hadoop.yarn.security.AccessType;
 import org.apache.hadoop.yarn.security.Permission;
 import org.apache.hadoop.yarn.security.PrivilegedEntity;
 import org.apache.hadoop.yarn.security.PrivilegedEntity.EntityType;
-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.policies.FifoPolicy;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerUtils;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.policies.FifoPolicy;
 import org.apache.hadoop.yarn.util.Clock;
 import org.apache.hadoop.yarn.util.SystemClock;
 import org.apache.hadoop.yarn.util.resource.Resources;
@@ -57,7 +47,17 @@ import org.w3c.dom.NodeList;
 import org.w3c.dom.Text;
 import org.xml.sax.SAXException;
 
-import com.google.common.annotations.VisibleForTesting;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.parsers.ParserConfigurationException;
+import java.io.IOException;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 @Public
 @Unstable
@@ -77,6 +77,9 @@ public class AllocationFileLoaderService extends AbstractService {
 
   public static final long THREAD_JOIN_TIMEOUT_MS = 1000;
 
+  //Permitted allocation file filesystems (case insensitive)
+  private static final String SUPPORTED_FS_REGEX =
+      "(?i)(hdfs)|(file)|(s3a)|(viewfs)";
   private static final String ROOT = "root";
   private static final AccessControlList EVERYBODY_ACL =
       new AccessControlList("*");
@@ -85,12 +88,14 @@ public class AllocationFileLoaderService extends AbstractService {
 
   private final Clock clock;
 
-  private long lastSuccessfulReload; // Last time we successfully reloaded queues
-  private boolean lastReloadAttemptFailed = false;
-  
-  // Path to XML file containing allocations. 
-  private File allocFile;
-  
+  // Last time we successfully reloaded queues
+  private volatile long lastSuccessfulReload;
+  private volatile boolean lastReloadAttemptFailed = false;
+
+  // Path to XML file containing allocations.
+  private Path allocFile;
+  private FileSystem fs;
+
   private Listener reloadListener;
   
   @VisibleForTesting
@@ -108,19 +113,19 @@ public class AllocationFileLoaderService extends AbstractService {
   public AllocationFileLoaderService(Clock clock) {
     super(AllocationFileLoaderService.class.getName());
     this.clock = clock;
-    
   }
   
   @Override
   public void serviceInit(Configuration conf) throws Exception {
     this.allocFile = getAllocationFile(conf);
-    if (allocFile != null) {
-      reloadThread = new Thread() {
-        @Override
-        public void run() {
-          while (running) {
+    if(this.allocFile != null) {
+      this.fs = allocFile.getFileSystem(conf);
+      reloadThread = new Thread(() -> {
+        while (running) {
+          try {
             long time = clock.getTime();
-            long lastModified = allocFile.lastModified();
+            long lastModified =
+                fs.getFileStatus(allocFile).getModificationTime();
             if (lastModified > lastSuccessfulReload &&
                 time > lastModified + ALLOC_RELOAD_WAIT_MS) {
               try {
@@ -136,19 +141,21 @@ public class AllocationFileLoaderService extends AbstractService {
               if (!lastReloadAttemptFailed) {
                 LOG.warn("Failed to reload fair scheduler config file because" +
                     " last modified returned 0. File exists: "
-                    + allocFile.exists());
+                    + fs.exists(allocFile));
               }
               lastReloadAttemptFailed = true;
             }
-            try {
-              Thread.sleep(reloadIntervalMs);
-            } catch (InterruptedException ex) {
-              LOG.info(
-                  "Interrupted while waiting to reload alloc configuration");
-            }
+          } catch (IOException e) {
+            LOG.info("Exception while loading allocation file: " + e);
+          }
+          try {
+            Thread.sleep(reloadIntervalMs);
+          } catch (InterruptedException ex) {
+            LOG.info(
+                "Interrupted while waiting to reload alloc configuration");
           }
         }
-      };
+      });
       reloadThread.setName("AllocationFileReloader");
       reloadThread.setDaemon(true);
     }
@@ -182,24 +189,31 @@ public class AllocationFileLoaderService extends AbstractService {
    * path is relative, it is searched for in the
    * classpath, but loaded like a regular File.
    */
-  public File getAllocationFile(Configuration conf) {
+  public Path getAllocationFile(Configuration conf)
+      throws UnsupportedFileSystemException {
     String allocFilePath = conf.get(FairSchedulerConfiguration.ALLOCATION_FILE,
         FairSchedulerConfiguration.DEFAULT_ALLOCATION_FILE);
-    File allocFile = new File(allocFilePath);
-    if (!allocFile.isAbsolute()) {
+    Path allocPath = new Path(allocFilePath);
+    String allocPathScheme = allocPath.toUri().getScheme();
+    if(allocPathScheme != null && !allocPathScheme.matches(SUPPORTED_FS_REGEX)){
+      throw new UnsupportedFileSystemException("Allocation file "
+          + allocFilePath + " uses an unsupported filesystem");
+    } else if (!allocPath.isAbsolute()) {
       URL url = Thread.currentThread().getContextClassLoader()
           .getResource(allocFilePath);
       if (url == null) {
         LOG.warn(allocFilePath + " not found on the classpath.");
-        allocFile = null;
+        allocPath = null;
       } else if (!url.getProtocol().equalsIgnoreCase("file")) {
         throw new RuntimeException("Allocation file " + url
             + " found on the classpath is not on the local filesystem.");
       } else {
-        allocFile = new File(url.getPath());
+        allocPath = new Path(url.getProtocol(), null, url.getPath());
       }
+    } else if (allocPath.isAbsoluteAndSchemeAuthorityNull()){
+      allocPath = new Path("file", null, allocFilePath);
     }
-    return allocFile;
+    return allocPath;
   }
   
   public synchronized void setReloadListener(Listener reloadListener) {
@@ -226,8 +240,8 @@ public class AllocationFileLoaderService extends AbstractService {
     // Create some temporary hashmaps to hold the new allocs, and we only save
     // them in our fields if we have parsed the entire allocs file successfully.
     Map<String, Resource> minQueueResources = new HashMap<>();
-    Map<String, Resource> maxQueueResources = new HashMap<>();
-    Map<String, Resource> maxChildQueueResources = new HashMap<>();
+    Map<String, ConfigurableResource> maxQueueResources = new HashMap<>();
+    Map<String, ConfigurableResource> maxChildQueueResources = new HashMap<>();
     Map<String, Integer> queueMaxApps = new HashMap<>();
     Map<String, Integer> userMaxApps = new HashMap<>();
     Map<String, Float> queueMaxAMShares = new HashMap<>();
@@ -244,7 +258,8 @@ public class AllocationFileLoaderService extends AbstractService {
     Set<String> nonPreemptableQueues = new HashSet<>();
     int userMaxAppsDefault = Integer.MAX_VALUE;
     int queueMaxAppsDefault = Integer.MAX_VALUE;
-    Resource queueMaxResourcesDefault = Resources.unbounded();
+    ConfigurableResource queueMaxResourcesDefault =
+        new ConfigurableResource(Resources.unbounded());
     float queueMaxAMShareDefault = 0.5f;
     long defaultFairSharePreemptionTimeout = Long.MAX_VALUE;
     long defaultMinSharePreemptionTimeout = Long.MAX_VALUE;
@@ -273,7 +288,7 @@ public class AllocationFileLoaderService extends AbstractService {
       DocumentBuilderFactory.newInstance();
     docBuilderFactory.setIgnoringComments(true);
     DocumentBuilder builder = docBuilderFactory.newDocumentBuilder();
-    Document doc = builder.parse(allocFile);
+    Document doc = builder.parse(fs.open(allocFile));
     Element root = doc.getDocumentElement();
     if (!"allocations".equals(root.getTagName()))
       throw new AllocationConfigurationException("Bad fair scheduler config " +
@@ -305,7 +320,7 @@ public class AllocationFileLoaderService extends AbstractService {
           }
         } else if ("queueMaxResourcesDefault".equals(element.getTagName())) {
           String text = ((Text)element.getFirstChild()).getData().trim();
-          Resource val =
+          ConfigurableResource val =
               FairSchedulerConfiguration.parseResourceConfigValue(text);
           queueMaxResourcesDefault = val;
         } else if ("userMaxAppsDefault".equals(element.getTagName())) {
@@ -436,7 +451,7 @@ public class AllocationFileLoaderService extends AbstractService {
           fairSharePreemptionTimeouts, fairSharePreemptionThresholds, queueAcls,
           reservationAcls, newPlacementPolicy, configuredQueues,
           globalReservationQueueConfig, reservableQueues, nonPreemptableQueues);
-    
+
     lastSuccessfulReload = clock.getTime();
     lastReloadAttemptFailed = false;
 
@@ -448,8 +463,8 @@ public class AllocationFileLoaderService extends AbstractService {
    */
   private void loadQueue(String parentName, Element element,
       Map<String, Resource> minQueueResources,
-      Map<String, Resource> maxQueueResources,
-      Map<String, Resource> maxChildQueueResources,
+      Map<String, ConfigurableResource> maxQueueResources,
+      Map<String, ConfigurableResource> maxChildQueueResources,
       Map<String, Integer> queueMaxApps,
       Map<String, Integer> userMaxApps,
       Map<String, Float> queueMaxAMShares,
@@ -496,17 +511,17 @@ public class AllocationFileLoaderService extends AbstractService {
       Element field = (Element) fieldNode;
       if ("minResources".equals(field.getTagName())) {
         String text = ((Text)field.getFirstChild()).getData().trim();
-        Resource val =
+        ConfigurableResource val =
             FairSchedulerConfiguration.parseResourceConfigValue(text);
-        minQueueResources.put(queueName, val);
+        minQueueResources.put(queueName, val.getResource());
       } else if ("maxResources".equals(field.getTagName())) {
         String text = ((Text)field.getFirstChild()).getData().trim();
-        Resource val =
+        ConfigurableResource val =
             FairSchedulerConfiguration.parseResourceConfigValue(text);
         maxQueueResources.put(queueName, val);
       } else if ("maxChildResources".equals(field.getTagName())) {
         String text = ((Text)field.getFirstChild()).getData().trim();
-        Resource val =
+        ConfigurableResource val =
             FairSchedulerConfiguration.parseResourceConfigValue(text);
         maxChildQueueResources.put(queueName, val);
       } else if ("maxRunningApps".equals(field.getTagName())) {
@@ -606,14 +621,24 @@ public class AllocationFileLoaderService extends AbstractService {
 
     queueAcls.put(queueName, acls);
     resAcls.put(queueName, racls);
-    if (maxQueueResources.containsKey(queueName) &&
-        minQueueResources.containsKey(queueName)
-        && !Resources.fitsIn(minQueueResources.get(queueName),
-            maxQueueResources.get(queueName))) {
-      LOG.warn(
-          String.format("Queue %s has max resources %s less than "
-              + "min resources %s", queueName, maxQueueResources.get(queueName),
-              minQueueResources.get(queueName)));
+    checkMinAndMaxResource(minQueueResources, maxQueueResources, queueName);
+  }
+
+  private void checkMinAndMaxResource(Map<String, Resource> minResources,
+      Map<String, ConfigurableResource> maxResources, String queueName) {
+
+    ConfigurableResource maxConfigurableResource = maxResources.get(queueName);
+    Resource minResource = minResources.get(queueName);
+
+    if (maxConfigurableResource != null && minResource != null) {
+      Resource maxResource = maxConfigurableResource.getResource();
+
+      // check whether max resource is bigger or equals to min resource when max
+      // resource are absolute values
+      if (maxResource != null && !Resources.fitsIn(minResource, maxResource)) {
+        LOG.warn(String.format("Queue %s has max resources %s less than "
+            + "min resources %s", queueName, maxResource, minResource));
+      }
     }
   }
 

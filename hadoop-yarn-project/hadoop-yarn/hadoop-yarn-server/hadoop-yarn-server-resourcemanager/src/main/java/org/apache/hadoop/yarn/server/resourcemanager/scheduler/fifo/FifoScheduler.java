@@ -255,6 +255,9 @@ public class FifoScheduler extends
   public void serviceInit(Configuration conf) throws Exception {
     initScheduler(conf);
     super.serviceInit(conf);
+
+    // Initialize SchedulingMonitorManager
+    schedulingMonitorManager.initialize(rmContext, conf);
   }
 
   @Override
@@ -312,6 +315,7 @@ public class FifoScheduler extends
       reinitialize(Configuration conf, RMContext rmContext) throws IOException
   {
     setConf(conf);
+    super.reinitialize(conf, rmContext);
   }
 
   @Override
@@ -973,6 +977,16 @@ public class FifoScheduler extends
     }
 
     updateAvailableResourcesMetrics();
+  }
+
+  @VisibleForTesting
+  @Override
+  public void killContainer(RMContainer container) {
+    ContainerStatus status = SchedulerUtils.createKilledContainerStatus(
+        container.getContainerId(),
+        "Killed by RM to simulate an AM container failure");
+    LOG.info("Killing container " + container);
+    completedContainer(container, status, RMContainerEventType.KILL);
   }
 
   @Override

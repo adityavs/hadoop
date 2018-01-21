@@ -41,14 +41,13 @@ import java.util.Vector;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.Arrays;
 
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.GnuParser;
 import org.apache.commons.cli.HelpFormatter;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceAudience.Private;
 import org.apache.hadoop.classification.InterfaceStability;
@@ -92,6 +91,10 @@ import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.api.records.ResourceRequest;
 import org.apache.hadoop.yarn.api.records.URL;
 import org.apache.hadoop.yarn.api.records.UpdatedContainer;
+import org.apache.hadoop.yarn.api.records.ExecutionType;
+import org.apache.hadoop.yarn.api.records.ExecutionTypeRequest;
+import org.apache.hadoop.yarn.api.records.UpdateContainerRequest;
+import org.apache.hadoop.yarn.api.records.ContainerUpdateType;
 import org.apache.hadoop.yarn.api.records.timeline.TimelineEntity;
 import org.apache.hadoop.yarn.api.records.timeline.TimelineEntityGroupId;
 import org.apache.hadoop.yarn.api.records.timeline.TimelineEvent;
@@ -108,11 +111,14 @@ import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
 import org.apache.hadoop.yarn.security.AMRMTokenIdentifier;
 import org.apache.hadoop.yarn.util.SystemClock;
 import org.apache.hadoop.yarn.util.TimelineServiceHelper;
+import org.apache.hadoop.yarn.util.resource.ResourceUtils;
 import org.apache.hadoop.yarn.util.timeline.TimelineUtils;
 import org.apache.log4j.LogManager;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.sun.jersey.api.client.ClientHandlerException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * An ApplicationMaster for executing shell commands on a set of launched
@@ -179,7 +185,8 @@ import com.sun.jersey.api.client.ClientHandlerException;
 @InterfaceStability.Unstable
 public class ApplicationMaster {
 
-  private static final Log LOG = LogFactory.getLog(ApplicationMaster.class);
+  private static final Logger LOG = LoggerFactory
+      .getLogger(ApplicationMaster.class);
 
   @VisibleForTesting
   @Private
@@ -238,8 +245,16 @@ public class ApplicationMaster {
   // VirtualCores to request for the container on which the shell command will run
   private static final int DEFAULT_CONTAINER_VCORES = 1;
   private int containerVirtualCores = DEFAULT_CONTAINER_VCORES;
+  // All other resources to request for the container
+  // on which the shell command will run
+  private Map<String, Long> containerResources = new HashMap<>();
   // Priority of the request
   private int requestPriority;
+  // Execution type of the containers.
+  // Default GUARANTEED.
+  private ExecutionType containerType = ExecutionType.GUARANTEED;
+  // Whether to automatically promote opportunistic containers.
+  private boolean autoPromoteContainers = false;
 
   // Resource profile for the container
   private String containerResourceProfile = "";
@@ -308,7 +323,8 @@ public class ApplicationMaster {
   TimelineClient timelineClient;
 
   // Timeline v2 Client
-  private TimelineV2Client timelineV2Client;
+  @VisibleForTesting
+  TimelineV2Client timelineV2Client;
 
   static final String CONTAINER_ENTITY_GROUP_ID = "CONTAINERS";
   static final String APPID_TIMELINE_FILTER_NAME = "appId";
@@ -349,7 +365,7 @@ public class ApplicationMaster {
       appMaster.run();
       result = appMaster.finish();
     } catch (Throwable t) {
-      LOG.fatal("Error running ApplicationMaster", t);
+      LOG.error("Error running ApplicationMaster", t);
       LogManager.shutdown();
       ExitUtil.terminate(1, t);
     }
@@ -388,7 +404,7 @@ public class ApplicationMaster {
     } catch (IOException e) {
       e.printStackTrace();
     } finally {
-      IOUtils.cleanup(LOG, buf);
+      IOUtils.cleanupWithLogger(LOG, buf);
     }
   }
 
@@ -411,10 +427,19 @@ public class ApplicationMaster {
         "App Attempt ID. Not to be used unless for testing purposes");
     opts.addOption("shell_env", true,
         "Environment for shell script. Specified as env_key=env_val pairs");
+    opts.addOption("container_type", true,
+        "Container execution type, GUARANTEED or OPPORTUNISTIC");
+    opts.addOption("promote_opportunistic_after_start", false,
+        "Flag to indicate whether to automatically promote opportunistic"
+            + " containers to guaranteed.");
     opts.addOption("container_memory", true,
         "Amount of memory in MB to be requested to run the shell command");
     opts.addOption("container_vcores", true,
         "Amount of virtual cores to be requested to run the shell command");
+    opts.addOption("container_resources", true,
+        "Amount of resources to be requested to run the shell command. " +
+        "Specified as resource type=value pairs separated by commas. " +
+        "E.g. -container_resources memory-mb=512,vcores=1");
     opts.addOption("container_resource_profile", true,
         "Resource profile to be requested to run the shell command");
     opts.addOption("num_containers", true,
@@ -557,10 +582,31 @@ public class ApplicationMaster {
       domainId = envs.get(DSConstants.DISTRIBUTEDSHELLTIMELINEDOMAIN);
     }
 
+    if (cliParser.hasOption("container_type")) {
+      String containerTypeStr = cliParser.getOptionValue("container_type");
+      if (Arrays.stream(ExecutionType.values()).noneMatch(
+          executionType -> executionType.toString()
+              .equals(containerTypeStr))) {
+        throw new IllegalArgumentException("Invalid container_type: "
+            + containerTypeStr);
+      }
+      containerType = ExecutionType.valueOf(containerTypeStr);
+    }
+    if (cliParser.hasOption("promote_opportunistic_after_start")) {
+      autoPromoteContainers = true;
+    }
     containerMemory = Integer.parseInt(cliParser.getOptionValue(
         "container_memory", "-1"));
     containerVirtualCores = Integer.parseInt(cliParser.getOptionValue(
         "container_vcores", "-1"));
+    containerResources = new HashMap<>();
+    if (cliParser.hasOption("container_resources")) {
+      Map<String, Long> resources = Client.parseResourcesString(
+          cliParser.getOptionValue("container_resources"));
+      for (Map.Entry<String, Long> entry : resources.entrySet()) {
+        containerResources.put(entry.getKey(), entry.getValue());
+      }
+    }
     containerResourceProfile =
         cliParser.getOptionValue("container_resource_profile", "");
     numTotalContainers = Integer.parseInt(cliParser.getOptionValue(
@@ -587,11 +633,7 @@ public class ApplicationMaster {
     containrRetryInterval = Integer.parseInt(cliParser.getOptionValue(
         "container_retry_interval", "0"));
 
-    if (YarnConfiguration.timelineServiceEnabled(conf)) {
-      timelineServiceV2Enabled =
-          ((int) YarnConfiguration.getTimelineServiceVersion(conf) == 2);
-      timelineServiceV1Enabled = !timelineServiceV2Enabled;
-    } else {
+    if (!YarnConfiguration.timelineServiceEnabled(conf)) {
       timelineClient = null;
       timelineV2Client = null;
       LOG.warn("Timeline service is not enabled");
@@ -630,7 +672,7 @@ public class ApplicationMaster {
     LOG.info("Executing with tokens:");
     while (iter.hasNext()) {
       Token<?> token = iter.next();
-      LOG.info(token);
+      LOG.info(token.toString());
       if (token.getKind().equals(AMRMTokenIdentifier.KIND_NAME)) {
         iter.remove();
       }
@@ -659,12 +701,11 @@ public class ApplicationMaster {
     if (timelineServiceV2Enabled) {
       // need to bind timelineClient
       amRMClient.registerTimelineV2Client(timelineV2Client);
-    }
-
-    if (timelineServiceV2Enabled) {
       publishApplicationAttemptEventOnTimelineServiceV2(
           DSEvent.DS_APP_ATTEMPT_START);
-    } else if (timelineServiceV1Enabled) {
+    }
+
+    if (timelineServiceV1Enabled) {
       publishApplicationAttemptEvent(timelineClient, appAttemptID.toString(),
           DSEvent.DS_APP_ATTEMPT_START, domainId, appSubmitterUgi);
     }
@@ -682,6 +723,7 @@ public class ApplicationMaster {
         .registerApplicationMaster(appMasterHostname, appMasterRpcPort,
             appMasterTrackingUrl);
     resourceProfiles = response.getResourceProfiles();
+    ResourceUtils.reinitializeResources(response.getResourceTypes());
     // Dump out information about cluster capability as seen by the
     // resource manager
     long maxMem = response.getMaximumResourceCapability().getMemorySize();
@@ -738,18 +780,23 @@ public class ApplicationMaster {
         @Override
         public Void run() throws Exception {
           if (YarnConfiguration.timelineServiceEnabled(conf)) {
+            timelineServiceV1Enabled =
+                YarnConfiguration.timelineServiceV1Enabled(conf);
+            timelineServiceV2Enabled =
+                YarnConfiguration.timelineServiceV2Enabled(conf);
             // Creating the Timeline Client
+            if (timelineServiceV1Enabled) {
+              timelineClient = TimelineClient.createTimelineClient();
+              timelineClient.init(conf);
+              timelineClient.start();
+              LOG.info("Timeline service V1 client is enabled");
+            }
             if (timelineServiceV2Enabled) {
               timelineV2Client = TimelineV2Client.createTimelineClient(
                   appAttemptID.getApplicationId());
               timelineV2Client.init(conf);
               timelineV2Client.start();
               LOG.info("Timeline service V2 client is enabled");
-            } else {
-              timelineClient = TimelineClient.createTimelineClient();
-              timelineClient.init(conf);
-              timelineClient.start();
-              LOG.info("Timeline service V1 client is enabled");
             }
           } else {
             timelineClient = null;
@@ -779,12 +826,14 @@ public class ApplicationMaster {
       } catch (InterruptedException ex) {}
     }
 
+    if (timelineServiceV1Enabled) {
+      publishApplicationAttemptEvent(timelineClient, appAttemptID.toString(),
+          DSEvent.DS_APP_ATTEMPT_END, domainId, appSubmitterUgi);
+    }
+
     if (timelineServiceV2Enabled) {
       publishApplicationAttemptEventOnTimelineServiceV2(
           DSEvent.DS_APP_ATTEMPT_END);
-    } else if (timelineServiceV1Enabled) {
-      publishApplicationAttemptEvent(timelineClient, appAttemptID.toString(),
-          DSEvent.DS_APP_ATTEMPT_END, domainId, appSubmitterUgi);
     }
 
     // Join all launched threads
@@ -835,7 +884,8 @@ public class ApplicationMaster {
     // Stop Timeline Client
     if(timelineServiceV1Enabled) {
       timelineClient.stop();
-    } else if (timelineServiceV2Enabled) {
+    }
+    if (timelineServiceV2Enabled) {
       timelineV2Client.stop();
     }
 
@@ -901,7 +951,8 @@ public class ApplicationMaster {
           }
           publishContainerEndEventOnTimelineServiceV2(containerStatus,
               containerStartTime);
-        } else if (timelineServiceV1Enabled) {
+        }
+        if (timelineServiceV1Enabled) {
           publishContainerEndEvent(timelineClient, containerStatus, domainId,
               appSubmitterUgi);
         }
@@ -958,7 +1009,24 @@ public class ApplicationMaster {
 
     @Override
     public void onContainersUpdated(
-        List<UpdatedContainer> containers) {}
+        List<UpdatedContainer> containers) {
+      for (UpdatedContainer container : containers) {
+        LOG.info("Container {} updated, updateType={}, resource={}, "
+                + "execType={}",
+            container.getContainer().getId(),
+            container.getUpdateType().toString(),
+            container.getContainer().getResource().toString(),
+            container.getContainer().getExecutionType());
+
+        // TODO Remove this line with finalized updateContainer API.
+        // Currently nm client needs to notify the NM to update container
+        // execution type via NMClient#updateContainerResource() or
+        // NMClientAsync#updateContainerResourceAsync() when
+        // auto-update.containers is disabled, but this API is
+        // under evolving and will need to be replaced by a proper new API.
+        nmClientAsync.updateContainerResourceAsync(container.getContainer());
+      }
+    }
 
     @Override
     public void onShutdownRequest() {
@@ -985,7 +1053,7 @@ public class ApplicationMaster {
   }
 
   @VisibleForTesting
-  static class NMCallbackHandler extends NMClientAsync.AbstractCallbackHandler {
+  class NMCallbackHandler extends NMClientAsync.AbstractCallbackHandler {
 
     private ConcurrentMap<ContainerId, Container> containers =
         new ConcurrentHashMap<ContainerId, Container>();
@@ -1014,6 +1082,24 @@ public class ApplicationMaster {
         LOG.debug("Container Status: id=" + containerId + ", status=" +
             containerStatus);
       }
+
+      // If promote_opportunistic_after_start is set, automatically promote
+      // opportunistic containers to guaranteed.
+      if (autoPromoteContainers) {
+        if (containerStatus.getState() == ContainerState.RUNNING) {
+          Container container = containers.get(containerId);
+          if (container.getExecutionType() == ExecutionType.OPPORTUNISTIC) {
+            // Promote container
+            LOG.info("Promoting container {} to {}", container.getId(),
+                container.getExecutionType());
+            UpdateContainerRequest updateRequest = UpdateContainerRequest
+                .newInstance(container.getVersion(), container.getId(),
+                    ContainerUpdateType.PROMOTE_EXECUTION_TYPE, null,
+                    ExecutionType.GUARANTEED);
+            amRMClient.requestContainerUpdate(container, updateRequest);
+          }
+        }
+      }
     }
 
     @Override
@@ -1032,7 +1118,8 @@ public class ApplicationMaster {
         applicationMaster.getContainerStartTimes().put(containerId, startTime);
         applicationMaster.publishContainerStartEventOnTimelineServiceV2(
             container, startTime);
-      } else if (applicationMaster.timelineServiceV1Enabled) {
+      }
+      if (applicationMaster.timelineServiceV1Enabled) {
         applicationMaster.publishContainerStartEvent(
             applicationMaster.timelineClient, container,
             applicationMaster.domainId, applicationMaster.appSubmitterUgi);
@@ -1241,7 +1328,9 @@ public class ApplicationMaster {
 
     // Set up resource type requirements
     ContainerRequest request =
-        new ContainerRequest(createProfileCapability(), null, null, pri);
+        new ContainerRequest(createProfileCapability(), null, null,
+            pri, 0, true, null,
+            ExecutionTypeRequest.newInstance(containerType));
     LOG.info("Requested container ask: " + request.toString());
     return request;
   }
@@ -1519,14 +1608,15 @@ public class ApplicationMaster {
 
     Resource resourceCapability =
         Resource.newInstance(containerMemory, containerVirtualCores);
-    if (resourceProfiles == null) {
-      containerMemory = containerMemory == -1 ? DEFAULT_CONTAINER_MEMORY :
-          containerMemory;
-      containerVirtualCores =
-          containerVirtualCores == -1 ? DEFAULT_CONTAINER_VCORES :
-              containerVirtualCores;
-      resourceCapability.setMemorySize(containerMemory);
-      resourceCapability.setVirtualCores(containerVirtualCores);
+    containerMemory =
+        containerMemory == -1 ? DEFAULT_CONTAINER_MEMORY : containerMemory;
+    containerVirtualCores = containerVirtualCores == -1 ?
+        DEFAULT_CONTAINER_VCORES :
+        containerVirtualCores;
+    resourceCapability.setMemorySize(containerMemory);
+    resourceCapability.setVirtualCores(containerVirtualCores);
+    for (Map.Entry<String, Long> entry : containerResources.entrySet()) {
+      resourceCapability.setResourceValue(entry.getKey(), entry.getValue());
     }
 
     String profileName = containerResourceProfile;

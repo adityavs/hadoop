@@ -21,12 +21,20 @@
 package org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime;
 
 import com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.yarn.server.nodemanager.Context;
+import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime.docker.DockerCommandExecutor;
+import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime.docker.DockerKillCommand;
+import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime.docker.DockerRmCommand;
+import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime.docker.DockerVolumeCommand;
+import org.apache.hadoop.yarn.server.nodemanager.containermanager.resourceplugin.DockerCommandPlugin;
+import org.apache.hadoop.yarn.server.nodemanager.containermanager.resourceplugin.ResourcePlugin;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.registry.client.api.RegistryConstants;
 import org.apache.hadoop.registry.client.binding.RegistryPathUtils;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.authorize.AccessControlList;
@@ -54,11 +62,13 @@ import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import static org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime.LinuxContainerRuntimeConstants.*;
@@ -128,6 +138,27 @@ import static org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.r
  *     source is an absolute path that is not a symlink and that points to a
  *     localized resource.
  *   </li>
+ *   <li>
+ *     {@code YARN_CONTAINER_RUNTIME_DOCKER_MOUNTS} allows users to specify
+ +     additional volume mounts for the Docker container. The value of the
+ *     environment variable should be a comma-separated list of mounts.
+ *     All such mounts must be given as {@code source:dest:mode}, and the mode
+ *     must be "ro" (read-only) or "rw" (read-write) to specify the type of
+ *     access being requested. The requested mounts will be validated by
+ *     container-executor based on the values set in container-executor.cfg for
+ *     {@code docker.allowed.ro-mounts} and {@code docker.allowed.rw-mounts}.
+ *   </li>
+ *   <li>
+ *     {@code YARN_CONTAINER_RUNTIME_DOCKER_DELAYED_REMOVAL} allows a user
+ *     to request delayed deletion of the Docker containers on a per
+ *     container basis. If true, Docker containers will not be removed until
+ *     the duration defined by {@code yarn.nodemanager.delete.debug-delay-sec}
+ *     has elapsed. Administrators can disable this feature through the
+ *     yarn-site property
+ *     {@code yarn.nodemanager.runtime.linux.docker.delayed-removal.allowed}.
+ *     This feature is disabled by default. When this feature is disabled or set
+ *     to false, the container will be removed as soon as it exits.
+ *   </li>
  * </ul>
  */
 @InterfaceAudience.Private
@@ -145,6 +176,8 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
       "^[a-zA-Z0-9][a-zA-Z0-9_.-]+$";
   private static final Pattern hostnamePattern = Pattern.compile(
       HOSTNAME_PATTERN);
+  private static final Pattern USER_MOUNT_PATTERN = Pattern.compile(
+      "(?<=^|,)([^:\\x00]+):([^:\\x00]+):([a-z]+)");
 
   @InterfaceAudience.Private
   public static final String ENV_DOCKER_CONTAINER_IMAGE =
@@ -170,8 +203,15 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
   @InterfaceAudience.Private
   public static final String ENV_DOCKER_CONTAINER_LOCAL_RESOURCE_MOUNTS =
       "YARN_CONTAINER_RUNTIME_DOCKER_LOCAL_RESOURCE_MOUNTS";
+  @InterfaceAudience.Private
+  public static final String ENV_DOCKER_CONTAINER_MOUNTS =
+      "YARN_CONTAINER_RUNTIME_DOCKER_MOUNTS";
+  @InterfaceAudience.Private
+  public static final String ENV_DOCKER_CONTAINER_DELAYED_REMOVAL =
+      "YARN_CONTAINER_RUNTIME_DOCKER_DELAYED_REMOVAL";
 
   private Configuration conf;
+  private Context nmContext;
   private DockerClient dockerClient;
   private PrivilegedOperationExecutor privilegedOperationExecutor;
   private Set<String> allowedNetworks = new HashSet<>();
@@ -182,6 +222,8 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
   private boolean enableUserReMapping;
   private int userRemappingUidThreshold;
   private int userRemappingGidThreshold;
+  private Set<String> capabilities;
+  private boolean delayedRemovalAllowed;
 
   /**
    * Return whether the given environment variables indicate that the operation
@@ -220,14 +262,14 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
    * Create an instance using the given {@link PrivilegedOperationExecutor}
    * instance for performing operations and the given {@link CGroupsHandler}
    * instance. This constructor is intended for use in testing.
-   *
-   * @param privilegedOperationExecutor the {@link PrivilegedOperationExecutor}
+   *  @param privilegedOperationExecutor the {@link PrivilegedOperationExecutor}
    * instance
    * @param cGroupsHandler the {@link CGroupsHandler} instance
    */
   @VisibleForTesting
-  public DockerLinuxContainerRuntime(PrivilegedOperationExecutor
-      privilegedOperationExecutor, CGroupsHandler cGroupsHandler) {
+  public DockerLinuxContainerRuntime(
+      PrivilegedOperationExecutor privilegedOperationExecutor,
+      CGroupsHandler cGroupsHandler) {
     this.privilegedOperationExecutor = privilegedOperationExecutor;
 
     if (cGroupsHandler == null) {
@@ -239,8 +281,9 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
   }
 
   @Override
-  public void initialize(Configuration conf)
+  public void initialize(Configuration conf, Context nmContext)
       throws ContainerExecutionException {
+    this.nmContext = nmContext;
     this.conf = conf;
     dockerClient = new DockerClient(conf);
     allowedNetworks.clear();
@@ -279,11 +322,150 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
     userRemappingGidThreshold = conf.getInt(
       YarnConfiguration.NM_DOCKER_USER_REMAPPING_GID_THRESHOLD,
       YarnConfiguration.DEFAULT_NM_DOCKER_USER_REMAPPING_GID_THRESHOLD);
+
+    capabilities = getDockerCapabilitiesFromConf();
+
+    delayedRemovalAllowed = conf.getBoolean(
+        YarnConfiguration.NM_DOCKER_ALLOW_DELAYED_REMOVAL,
+        YarnConfiguration.DEFAULT_NM_DOCKER_ALLOW_DELAYED_REMOVAL);
+  }
+
+  private Set<String> getDockerCapabilitiesFromConf() throws
+      ContainerExecutionException {
+    Set<String> caps = new HashSet<>(Arrays.asList(
+        conf.getTrimmedStrings(
+        YarnConfiguration.NM_DOCKER_CONTAINER_CAPABILITIES,
+        YarnConfiguration.DEFAULT_NM_DOCKER_CONTAINER_CAPABILITIES)));
+    if(caps.contains("none") || caps.contains("NONE")) {
+      if(caps.size() > 1) {
+        String msg = "Mixing capabilities with the none keyword is" +
+            " not supported";
+        throw new ContainerExecutionException(msg);
+      }
+      caps = Collections.emptySet();
+    }
+
+    return caps;
+  }
+
+  public Set<String> getCapabilities() {
+    return capabilities;
+  }
+
+  @Override
+  public boolean useWhitelistEnv(Map<String, String> env) {
+    // Avoid propagating nodemanager environment variables into the container
+    // so those variables can be picked up from the Docker image instead.
+    return false;
+  }
+
+  private String runDockerVolumeCommand(DockerVolumeCommand dockerVolumeCommand,
+      Container container) throws ContainerExecutionException {
+    try {
+      String commandFile = dockerClient.writeCommandToTempFile(
+          dockerVolumeCommand, container.getContainerId().toString());
+      PrivilegedOperation privOp = new PrivilegedOperation(
+          PrivilegedOperation.OperationType.RUN_DOCKER_CMD);
+      privOp.appendArgs(commandFile);
+      String output = privilegedOperationExecutor
+          .executePrivilegedOperation(null, privOp, null,
+              null, true, false);
+      LOG.info("ContainerId=" + container.getContainerId()
+          + ", docker volume output for " + dockerVolumeCommand + ": "
+          + output);
+      return output;
+    } catch (ContainerExecutionException e) {
+      LOG.error("Error when writing command to temp file, command="
+              + dockerVolumeCommand,
+          e);
+      throw e;
+    } catch (PrivilegedOperationException e) {
+      LOG.error("Error when executing command, command="
+          + dockerVolumeCommand, e);
+      throw new ContainerExecutionException(e);
+    }
+
   }
 
   @Override
   public void prepareContainer(ContainerRuntimeContext ctx)
       throws ContainerExecutionException {
+    Container container = ctx.getContainer();
+
+    // Create volumes when needed.
+    if (nmContext != null
+        && nmContext.getResourcePluginManager().getNameToPlugins() != null) {
+      for (ResourcePlugin plugin : nmContext.getResourcePluginManager()
+          .getNameToPlugins().values()) {
+        DockerCommandPlugin dockerCommandPlugin =
+            plugin.getDockerCommandPluginInstance();
+        if (dockerCommandPlugin != null) {
+          DockerVolumeCommand dockerVolumeCommand =
+              dockerCommandPlugin.getCreateDockerVolumeCommand(
+                  ctx.getContainer());
+          if (dockerVolumeCommand != null) {
+            runDockerVolumeCommand(dockerVolumeCommand, container);
+
+            // After volume created, run inspect to make sure volume properly
+            // created.
+            if (dockerVolumeCommand.getSubCommand().equals(
+                DockerVolumeCommand.VOLUME_CREATE_SUB_COMMAND)) {
+              checkDockerVolumeCreated(dockerVolumeCommand, container);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private void checkDockerVolumeCreated(
+      DockerVolumeCommand dockerVolumeCreationCommand, Container container)
+      throws ContainerExecutionException {
+    DockerVolumeCommand dockerVolumeInspectCommand = new DockerVolumeCommand(
+        DockerVolumeCommand.VOLUME_LS_SUB_COMMAND);
+    dockerVolumeInspectCommand.setFormat("{{.Name}},{{.Driver}}");
+    String output = runDockerVolumeCommand(dockerVolumeInspectCommand,
+        container);
+
+    // Parse output line by line and check if it matches
+    String volumeName = dockerVolumeCreationCommand.getVolumeName();
+    String driverName = dockerVolumeCreationCommand.getDriverName();
+    if (driverName == null) {
+      driverName = "local";
+    }
+
+    for (String line : output.split("\n")) {
+      line = line.trim();
+      String[] arr = line.split(",");
+      String v = arr[0].trim();
+      String d = null;
+      if (arr.length > 1) {
+        d = arr[1].trim();
+      }
+      if (d != null && volumeName.equals(v) && driverName.equals(d)) {
+        // Good we found it.
+        LOG.info(
+            "Docker volume-name=" + volumeName + " driver-name=" + driverName
+                + " already exists for container=" + container
+                .getContainerId() + ", continue...");
+        return;
+      }
+    }
+
+    // Couldn't find the volume
+    String message =
+        " Couldn't find volume=" + volumeName + " driver=" + driverName
+            + " for container=" + container.getContainerId()
+            + ", please check error message in log to understand "
+            + "why this happens.";
+    LOG.error(message);
+
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("All docker volumes in the system, command="
+          + dockerVolumeInspectCommand.toString());
+    }
+
+    throw new ContainerExecutionException(message);
   }
 
   private void validateContainerNetworkType(String network)
@@ -314,6 +496,11 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
       throws ContainerExecutionException {
     if (name == null || name.isEmpty()) {
       name = RegistryPathUtils.encodeYarnID(containerIdStr);
+
+      String domain = conf.get(RegistryConstants.KEY_DNS_DOMAIN);
+      if (domain != null) {
+        name += ("." + domain);
+      }
       validateHostname(name);
     }
 
@@ -544,10 +731,6 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
         LOCALIZED_RESOURCES);
     @SuppressWarnings("unchecked")
     List<String> userLocalDirs = ctx.getExecutionAttribute(USER_LOCAL_DIRS);
-    Set<String> capabilities = new HashSet<>(Arrays.asList(
-        conf.getTrimmedStrings(
-            YarnConfiguration.NM_DOCKER_CONTAINER_CAPABILITIES,
-            YarnConfiguration.DEFAULT_NM_DOCKER_CONTAINER_CAPABILITIES)));
 
     @SuppressWarnings("unchecked")
     DockerRunCommand runCommand = new DockerRunCommand(containerIdStr,
@@ -589,6 +772,32 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
       }
     }
 
+    if (environment.containsKey(ENV_DOCKER_CONTAINER_MOUNTS)) {
+      Matcher parsedMounts = USER_MOUNT_PATTERN.matcher(
+          environment.get(ENV_DOCKER_CONTAINER_MOUNTS));
+      if (!parsedMounts.find()) {
+        throw new ContainerExecutionException(
+            "Unable to parse user supplied mount list: "
+                + environment.get(ENV_DOCKER_CONTAINER_MOUNTS));
+      }
+      parsedMounts.reset();
+      while (parsedMounts.find()) {
+        String src = parsedMounts.group(1);
+        String dst = parsedMounts.group(2);
+        String mode = parsedMounts.group(3);
+        if (!mode.equals("ro") && !mode.equals("rw")) {
+          throw new ContainerExecutionException(
+              "Invalid mount mode requested for mount: "
+                  + parsedMounts.group());
+        }
+        if (mode.equals("ro")) {
+          runCommand.addReadOnlyMountLocation(src, dst);
+        } else {
+          runCommand.addReadWriteMountLocation(src, dst);
+        }
+      }
+    }
+
     if (allowPrivilegedContainerExecution(container)) {
       runCommand.setPrivileged();
     }
@@ -616,6 +825,19 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
       runCommand.groupAdd(groups);
     }
 
+    // use plugins to update docker run command.
+    if (nmContext != null
+        && nmContext.getResourcePluginManager().getNameToPlugins() != null) {
+      for (ResourcePlugin plugin : nmContext.getResourcePluginManager()
+          .getNameToPlugins().values()) {
+        DockerCommandPlugin dockerCommandPlugin =
+            plugin.getDockerCommandPluginInstance();
+        if (dockerCommandPlugin != null) {
+          dockerCommandPlugin.updateDockerRunCommand(runCommand, container);
+        }
+      }
+    }
+
     String commandFile = dockerClient.writeCommandToTempFile(runCommand,
         containerIdStr);
     PrivilegedOperation launchOp = buildLaunchOp(ctx,
@@ -633,49 +855,83 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
     }
   }
 
+  /**
+   * Signal the docker container.
+   *
+   * Signals are used to check the liveliness of the container as well as to
+   * stop/kill the container. The following outlines the docker container
+   * signal handling.
+   *
+   * <ol>
+   *     <li>If the null signal is sent, run kill -0 on the pid. This is used
+   *     to check if the container is still alive, which is necessary for
+   *     reacquiring containers on NM restart.</li>
+   *     <li>If SIGTERM, SIGKILL is sent, attempt to stop and remove the docker
+   *     container.</li>
+   *     <li>If the docker container exists and is running, execute docker
+   *     stop.</li>
+   *     <li>If any other signal is sent, signal the container using docker
+   *     kill.</li>
+   * </ol>
+   *
+   * @param ctx the {@link ContainerRuntimeContext}.
+   * @throws ContainerExecutionException if the signaling fails.
+   */
   @Override
   public void signalContainer(ContainerRuntimeContext ctx)
       throws ContainerExecutionException {
     ContainerExecutor.Signal signal = ctx.getExecutionAttribute(SIGNAL);
-
-    PrivilegedOperation privOp = null;
-    // Handle liveliness checks, send null signal to pid
-    if(ContainerExecutor.Signal.NULL.equals(signal)) {
-      privOp = new PrivilegedOperation(
-          PrivilegedOperation.OperationType.SIGNAL_CONTAINER);
-      privOp.appendArgs(ctx.getExecutionAttribute(RUN_AS_USER),
-          ctx.getExecutionAttribute(USER),
-          Integer.toString(PrivilegedOperation.RunAsUserCommand
-              .SIGNAL_CONTAINER.getValue()),
-          ctx.getExecutionAttribute(PID),
-          Integer.toString(ctx.getExecutionAttribute(SIGNAL).getValue()));
-
-    // All other signals handled as docker stop
-    } else {
-      String containerId = ctx.getContainer().getContainerId().toString();
-      DockerStopCommand stopCommand = new DockerStopCommand(containerId);
-      String commandFile = dockerClient.writeCommandToTempFile(stopCommand,
-          containerId);
-      privOp = new PrivilegedOperation(
-          PrivilegedOperation.OperationType.RUN_DOCKER_CMD);
-      privOp.appendArgs(commandFile);
-    }
-
-    //Some failures here are acceptable. Let the calling executor decide.
-    privOp.disableFailureLogging();
-
+    String containerId = ctx.getContainer().getContainerId().toString();
+    Map<String, String> env =
+        ctx.getContainer().getLaunchContext().getEnvironment();
     try {
-      privilegedOperationExecutor.executePrivilegedOperation(null,
-          privOp, null, null, false, false);
-    } catch (PrivilegedOperationException e) {
-      throw new ContainerExecutionException("Signal container failed", e
-          .getExitCode(), e.getOutput(), e.getErrorOutput());
+      if (ContainerExecutor.Signal.NULL.equals(signal)) {
+        executeLivelinessCheck(ctx);
+      } else {
+        if (ContainerExecutor.Signal.KILL.equals(signal)
+            || ContainerExecutor.Signal.TERM.equals(signal)) {
+          handleContainerStop(containerId, env);
+        } else {
+          handleContainerKill(containerId, env, signal);
+        }
+      }
+    } catch (ContainerExecutionException e) {
+      LOG.warn("Signal docker container failed. Exception: ", e);
+      throw new ContainerExecutionException("Signal docker container failed",
+          e.getExitCode(), e.getOutput(), e.getErrorOutput());
     }
   }
 
+  /**
+   * Reap the docker container.
+   *
+   * @param ctx the {@link ContainerRuntimeContext}.
+   * @throws ContainerExecutionException if the removal fails.
+   */
   @Override
   public void reapContainer(ContainerRuntimeContext ctx)
       throws ContainerExecutionException {
+    // Clean up the Docker container
+    handleContainerRemove(ctx.getContainer().getContainerId().toString(),
+        ctx.getContainer().getLaunchContext().getEnvironment());
+
+    // Cleanup volumes when needed.
+    if (nmContext != null
+        && nmContext.getResourcePluginManager().getNameToPlugins() != null) {
+      for (ResourcePlugin plugin : nmContext.getResourcePluginManager()
+          .getNameToPlugins().values()) {
+        DockerCommandPlugin dockerCommandPlugin =
+            plugin.getDockerCommandPluginInstance();
+        if (dockerCommandPlugin != null) {
+          DockerVolumeCommand dockerVolumeCommand =
+              dockerCommandPlugin.getCleanupDockerVolumesCommand(
+                  ctx.getContainer());
+          if (dockerVolumeCommand != null) {
+            runDockerVolumeCommand(dockerVolumeCommand, ctx.getContainer());
+          }
+        }
+      }
+    }
   }
 
 
@@ -696,6 +952,8 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
           .executePrivilegedOperation(null, privOp, null,
               null, true, false);
       LOG.info("Docker inspect output for " + containerId + ": " + output);
+      // strip off quotes if any
+      output = output.replaceAll("['\"]", "");
       int index = output.lastIndexOf(',');
       if (index == -1) {
         LOG.error("Incorrect format for ip and host");
@@ -772,6 +1030,85 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
     if (!dockerImagePattern.matcher(imageName).matches()) {
       throw new ContainerExecutionException("Image name '" + imageName
           + "' doesn't match docker image name pattern");
+    }
+  }
+
+  private void executeLivelinessCheck(ContainerRuntimeContext ctx)
+      throws ContainerExecutionException {
+    PrivilegedOperation signalOp = new PrivilegedOperation(
+        PrivilegedOperation.OperationType.SIGNAL_CONTAINER);
+    signalOp.appendArgs(ctx.getExecutionAttribute(RUN_AS_USER),
+        ctx.getExecutionAttribute(USER), Integer.toString(
+            PrivilegedOperation.RunAsUserCommand.SIGNAL_CONTAINER.getValue()),
+        ctx.getExecutionAttribute(PID),
+        Integer.toString(ctx.getExecutionAttribute(SIGNAL).getValue()));
+    signalOp.disableFailureLogging();
+    try {
+      privilegedOperationExecutor.executePrivilegedOperation(null, signalOp,
+          null, ctx.getContainer().getLaunchContext().getEnvironment(), false,
+          false);
+    } catch (PrivilegedOperationException e) {
+      String msg = "Liveliness check failed for PID: "
+          + ctx.getExecutionAttribute(PID)
+          + ". Container may have already completed.";
+      throw new ContainerExecutionException(msg, e.getExitCode(), e.getOutput(),
+          e.getErrorOutput());
+    }
+  }
+
+  private void handleContainerStop(String containerId, Map<String, String> env)
+      throws ContainerExecutionException {
+    DockerCommandExecutor.DockerContainerStatus containerStatus =
+        DockerCommandExecutor.getContainerStatus(containerId, conf,
+            privilegedOperationExecutor);
+    if (DockerCommandExecutor.isStoppable(containerStatus)) {
+      DockerStopCommand dockerStopCommand = new DockerStopCommand(containerId);
+      DockerCommandExecutor.executeDockerCommand(dockerStopCommand, containerId,
+          env, conf, privilegedOperationExecutor, false);
+    } else {
+      if (LOG.isDebugEnabled()) {
+        LOG.debug(
+            "Container status is " + containerStatus.getName()
+                + ", skipping stop - " + containerId);
+      }
+    }
+  }
+
+  private void handleContainerKill(String containerId, Map<String, String> env,
+      ContainerExecutor.Signal signal) throws ContainerExecutionException {
+    DockerCommandExecutor.DockerContainerStatus containerStatus =
+        DockerCommandExecutor.getContainerStatus(containerId, conf,
+            privilegedOperationExecutor);
+    if (DockerCommandExecutor.isKillable(containerStatus)) {
+      DockerKillCommand dockerKillCommand =
+          new DockerKillCommand(containerId).setSignal(signal.name());
+      DockerCommandExecutor.executeDockerCommand(dockerKillCommand, containerId,
+          env, conf, privilegedOperationExecutor, false);
+    } else {
+      if (LOG.isDebugEnabled()) {
+        LOG.debug(
+            "Container status is " + containerStatus.getName()
+                + ", skipping kill - " + containerId);
+      }
+    }
+  }
+
+  private void handleContainerRemove(String containerId,
+      Map<String, String> env) throws ContainerExecutionException {
+    String delayedRemoval = env.get(ENV_DOCKER_CONTAINER_DELAYED_REMOVAL);
+    if (delayedRemovalAllowed && delayedRemoval != null
+        && delayedRemoval.equalsIgnoreCase("true")) {
+      LOG.info("Delayed removal requested and allowed, skipping removal - "
+          + containerId);
+    } else {
+      DockerCommandExecutor.DockerContainerStatus containerStatus =
+          DockerCommandExecutor.getContainerStatus(containerId, conf,
+              privilegedOperationExecutor);
+      if (DockerCommandExecutor.isRemovable(containerStatus)) {
+        DockerRmCommand dockerRmCommand = new DockerRmCommand(containerId);
+        DockerCommandExecutor.executeDockerCommand(dockerRmCommand, containerId,
+            env, conf, privilegedOperationExecutor, false);
+      }
     }
   }
 }

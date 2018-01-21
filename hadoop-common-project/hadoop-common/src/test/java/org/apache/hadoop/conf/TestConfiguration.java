@@ -56,7 +56,6 @@ import org.apache.commons.lang.StringUtils;
 import org.apache.hadoop.conf.Configuration.IntegerRanges;
 import org.apache.hadoop.fs.FileUtil;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.net.NetUtils;
 import org.apache.hadoop.security.alias.CredentialProvider;
 import org.apache.hadoop.security.alias.CredentialProviderFactory;
@@ -385,11 +384,9 @@ public class TestConfiguration {
       Configuration conf = new Configuration(false);
       conf.addResource(new Path(CONFIG_MULTI_BYTE));
       assertEquals(value, conf.get(name));
-      FileOutputStream fos = new FileOutputStream(CONFIG_MULTI_BYTE_SAVED);
-      try {
+      try (FileOutputStream fos =
+               new FileOutputStream(CONFIG_MULTI_BYTE_SAVED)) {
         conf.writeXml(fos);
-      } finally {
-        IOUtils.closeStream(fos);
       }
 
       conf = new Configuration(false);
@@ -2240,6 +2237,21 @@ public class TestConfiguration {
         CoreMatchers.is(password.toCharArray()));
 
     FileUtil.fullyDelete(tmpDir);
+  }
+
+  public void testGettingPropertiesWithPrefix() throws Exception {
+    Configuration conf = new Configuration();
+    for (int i = 0; i < 10; i++) {
+      conf.set("prefix" + ".name" + i, "value");
+    }
+    conf.set("different.prefix" + ".name", "value");
+    Map<String, String> props = conf.getPropsWithPrefix("prefix");
+    assertEquals(props.size(), 10);
+
+    // test call with no properties for a given prefix
+    props = conf.getPropsWithPrefix("none");
+    assertNotNull(props.isEmpty());
+    assertTrue(props.isEmpty());
   }
 
   public static void main(String[] argv) throws Exception {

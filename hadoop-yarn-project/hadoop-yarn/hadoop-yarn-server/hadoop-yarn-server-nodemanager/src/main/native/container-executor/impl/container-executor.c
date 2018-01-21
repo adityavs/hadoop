@@ -19,6 +19,7 @@
 #include "configuration.h"
 #include "container-executor.h"
 #include "utils/docker-util.h"
+#include "utils/path-utils.h"
 #include "util.h"
 #include "config.h"
 
@@ -38,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <limits.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
@@ -70,6 +72,8 @@ static const char* DEFAULT_BANNED_USERS[] = {"yarn", "mapred", "hdfs", "bin", 0}
 
 static const int DEFAULT_DOCKER_SUPPORT_ENABLED = 0;
 static const int DEFAULT_TC_SUPPORT_ENABLED = 0;
+
+static const char* PROC_PATH = "/proc";
 
 //location of traffic control binary
 static const char* TC_BIN = "/sbin/tc";
@@ -438,19 +442,25 @@ int is_feature_enabled(const char* feature_key, int default_value,
     int enabled = default_value;
 
     if (enabled_str != NULL) {
-        char *end_ptr = NULL;
-        enabled = strtol(enabled_str, &end_ptr, 10);
+        if (strcasecmp(enabled_str, "true") == 0) {
+            enabled = 1;
+        } else if (strcasecmp(enabled_str, "false") == 0) {
+            enabled = 0;
+        } else {
+            char *end_ptr = NULL;
+            enabled = strtol(enabled_str, &end_ptr, 10);
 
-        if ((enabled_str == end_ptr || *end_ptr != '\0') ||
-            (enabled < 0 || enabled > 1)) {
-              fprintf(LOGFILE, "Illegal value '%s' for '%s' in configuration. "
-              "Using default value: %d.\n", enabled_str, feature_key,
-              default_value);
-              fflush(LOGFILE);
-              free(enabled_str);
-              return default_value;
+            if ((enabled_str == end_ptr || *end_ptr != '\0') ||
+                (enabled < 0 || enabled > 1)) {
+                  fprintf(LOGFILE, "Illegal value '%s' for '%s' in configuration. "
+                  "Using default value: %d.\n", enabled_str, feature_key,
+                  default_value);
+                  fflush(LOGFILE);
+                  free(enabled_str);
+                  return default_value;
+            }
+
         }
-
         free(enabled_str);
         return enabled;
     } else {
@@ -517,7 +527,29 @@ char *get_app_directory(const char * nm_root, const char *user,
  * Get the user directory of a particular user
  */
 char *get_user_directory(const char *nm_root, const char *user) {
+  int result = check_nm_local_dir(nm_uid, nm_root);
+  if (result != 0) {
+    return NULL;
+  }
   return concatenate(USER_DIR_PATTERN, "user_dir_path", 2, nm_root, user);
+}
+
+/**
+ * Check node manager local dir permission.
+ */
+int check_nm_local_dir(uid_t caller_uid, const char *nm_root) {
+  struct stat info;
+  errno = 0;
+  int err = stat(nm_root, &info);
+  if (err < 0) {
+    fprintf(LOGFILE, "Error checking file stats for %s %d %s.\n", nm_root, err, strerror(errno));
+    return 1;
+  }
+  if (caller_uid != info.st_uid) {
+    fprintf(LOGFILE, "Permission mismatch for %s for caller uid: %d, owner uid: %d.\n", nm_root, caller_uid, info.st_uid);
+    return 1;
+  }
+  return 0;
 }
 
 /**
@@ -666,6 +698,11 @@ static int create_container_directories(const char* user, const char *app_id,
   for(local_dir_ptr = local_dir; *local_dir_ptr != NULL; ++local_dir_ptr) {
     char *container_dir = get_container_work_directory(*local_dir_ptr, user, app_id,
                                                 container_id);
+    int check = check_nm_local_dir(nm_uid, *local_dir_ptr);
+    if (check != 0) {
+      free(container_dir);
+      continue;
+    }
     if (container_dir == NULL) {
       return OUT_OF_MEMORY;
     }
@@ -692,6 +729,14 @@ static int create_container_directories(const char* user, const char *app_id,
     char* const* log_dir_ptr;
     for(log_dir_ptr = log_dir; *log_dir_ptr != NULL; ++log_dir_ptr) {
       char *container_log_dir = get_app_log_directory(*log_dir_ptr, combined_name);
+      int check = check_nm_local_dir(nm_uid, *log_dir_ptr);
+      if (check != 0) {
+        container_log_dir = NULL;
+      }
+      if (strstr(container_log_dir, "..") != 0) {
+        fprintf(LOGFILE, "Unsupported container log directory path detected.\n");
+        container_log_dir = NULL;
+      }
       if (container_log_dir == NULL) {
         free(combined_name);
         return OUT_OF_MEMORY;
@@ -1032,6 +1077,11 @@ int create_log_dirs(const char *app_id, char * const * log_dirs) {
   char *any_one_app_log_dir = NULL;
   for(log_root=log_dirs; *log_root != NULL; ++log_root) {
     char *app_log_dir = get_app_log_directory(*log_root, app_id);
+    int result = check_nm_local_dir(nm_uid, *log_root);
+    if (result != 0 && app_log_dir != NULL) {
+      free(app_log_dir);
+      app_log_dir = NULL;
+    }
     if (app_log_dir == NULL) {
       // try the next one
     } else if (create_directory_for_user(app_log_dir) != 0) {
@@ -1052,11 +1102,62 @@ int create_log_dirs(const char *app_id, char * const * log_dirs) {
   return 0;
 }
 
+char* get_container_log_directory(const char *log_root, const char* app_id,
+                                  const char *container_id) {
+  return concatenate("%s/%s/%s", "container log dir", 3, log_root, app_id,
+                     container_id);
+}
+
+int create_container_log_dirs(const char *container_id, const char *app_id,
+                              char * const * log_dirs) {
+  char* const* log_root;
+  int created_any_dir = 0;
+  for(log_root=log_dirs; *log_root != NULL; ++log_root) {
+    char *container_log_dir = get_container_log_directory(*log_root, app_id,
+                        container_id);
+
+    if (container_log_dir == NULL) {
+      fprintf(LOGFILE,
+              "Failed to get container log directory name! Log root directory: %s, App id: %s, Container id: %s\n",
+              *log_root, app_id, container_id);
+      continue;
+    }
+
+    int result = check_nm_local_dir(nm_uid, *log_root);
+    if (result != 0 && container_log_dir != NULL) {
+      fprintf(LOGFILE, "Unsupported container log directory path (%s) detected.\n",
+              container_log_dir);
+      free(container_log_dir);
+      container_log_dir = NULL;
+      continue;
+    }
+
+    if (create_directory_for_user(container_log_dir) != 0) {
+      fprintf(LOGFILE, "Failed to create container log directory (%s)!\n",
+              container_log_dir);
+      free(container_log_dir);
+      return -1;
+    }
+
+    if (!created_any_dir) {
+      created_any_dir = 1;
+    }
+
+    free(container_log_dir);
+  }
+
+  if (!created_any_dir) {
+    fprintf(LOGFILE, "Did not create any container log directory.\n");
+    return -1;
+  }
+  return 0;
+}
 
 /**
  * Function to prepare the application directories for the container.
  */
 int initialize_app(const char *user, const char *app_id,
+                   const char *container_id,
                    const char* nmPrivate_credentials_file,
                    char* const* local_dirs, char* const* log_roots,
                    char* const* args) {
@@ -1075,6 +1176,13 @@ int initialize_app(const char *user, const char *app_id,
   int log_create_result = create_log_dirs(app_id, log_roots);
   if (log_create_result != 0) {
     return log_create_result;
+  }
+
+  // create the log directories for the container on all disks
+  int container_log_create_result = create_container_log_dirs(container_id,
+                                    app_id, log_roots);
+  if (container_log_create_result != 0) {
+    return container_log_create_result;
   }
 
   // open up the credentials file
@@ -1320,6 +1428,7 @@ int launch_docker_container_as_user(const char * user, const char *app_id,
   char *docker_logs_command = NULL;
   char *docker_inspect_command = NULL;
   char *docker_rm_command = NULL;
+  char *docker_inspect_exitcode_command = NULL;
   int container_file_source =-1;
   int cred_file_source = -1;
   int BUFFER_SIZE = 4096;
@@ -1332,6 +1441,7 @@ int launch_docker_container_as_user(const char * user, const char *app_id,
   docker_logs_command = (char *) alloc_and_clear_memory(command_size, sizeof(char));
   docker_inspect_command = (char *) alloc_and_clear_memory(command_size, sizeof(char));
   docker_rm_command = (char *) alloc_and_clear_memory(command_size, sizeof(char));
+  docker_inspect_exitcode_command = (char *) alloc_and_clear_memory(command_size, sizeof(char));
 
   gid_t user_gid = getegid();
   uid_t prev_uid = geteuid();
@@ -1382,6 +1492,7 @@ int launch_docker_container_as_user(const char * user, const char *app_id,
   snprintf(docker_command_with_binary, command_size, "%s %s", docker_binary, docker_command);
 
   fprintf(LOGFILE, "Launching docker container...\n");
+  fprintf(LOGFILE, "Docker run command: %s\n", docker_command_with_binary);
   FILE* start_docker = popen(docker_command_with_binary, "r");
   if (pclose (start_docker) != 0)
   {
@@ -1397,9 +1508,11 @@ int launch_docker_container_as_user(const char * user, const char *app_id,
     docker_binary, container_id);
 
   fprintf(LOGFILE, "Inspecting docker container...\n");
+  fprintf(LOGFILE, "Docker inspect command: %s\n", docker_inspect_command);
   FILE* inspect_docker = popen(docker_inspect_command, "r");
   int pid = 0;
   int res = fscanf (inspect_docker, "%d", &pid);
+  fprintf(LOGFILE, "pid from docker inspect: %d\n", pid);
   if (pclose (inspect_docker) != 0 || res <= 0)
   {
     fprintf (ERRORFILE,
@@ -1437,17 +1550,45 @@ int launch_docker_container_as_user(const char * user, const char *app_id,
       goto cleanup;
     }
 
-    snprintf(docker_wait_command, command_size,
-      "%s wait %s", docker_binary, container_id);
-
-    fprintf(LOGFILE, "Waiting for docker container to finish...\n");
-    FILE* wait_docker = popen(docker_wait_command, "r");
-    res = fscanf (wait_docker, "%d", &exit_code);
-    if (pclose (wait_docker) != 0 || res <= 0) {
-      fprintf (ERRORFILE,
-       "Could not attach to docker; is container dead? %s.\n", docker_wait_command);
+    fprintf(LOGFILE, "Waiting for docker container to finish.\n");
+#ifdef __linux
+    size_t command_size = MIN(sysconf(_SC_ARG_MAX), 128*1024);
+    char* proc_pid_path = alloc_and_clear_memory(command_size, sizeof(char));
+    snprintf(proc_pid_path, command_size, "%s/%d", PROC_PATH, pid);
+    while (dir_exists(proc_pid_path) == 0) {
+      sleep(1);
+    }
+    if (dir_exists(proc_pid_path) == -1) {
+      fprintf(ERRORFILE, "Error occurred checking %s\n", proc_pid_path);
       fflush(ERRORFILE);
     }
+#else
+    while (kill(pid,0) == 0) {
+      sleep(1);
+    }
+#endif
+
+    sprintf(docker_inspect_exitcode_command,
+      "%s inspect --format {{.State.ExitCode}} %s",
+    docker_binary, container_id);
+    fprintf(LOGFILE, "Obtaining the exit code...\n");
+    fprintf(LOGFILE, "Docker inspect command: %s\n", docker_inspect_exitcode_command);
+    FILE* inspect_exitcode_docker = popen(docker_inspect_exitcode_command, "r");
+    if(inspect_exitcode_docker == NULL) {
+      fprintf(ERRORFILE, "Done with inspect_exitcode, inspect_exitcode_docker is null\n");
+      fflush(ERRORFILE);
+      exit_code = -1;
+      goto cleanup;
+    }
+    res = fscanf (inspect_exitcode_docker, "%d", &exit_code);
+    if (pclose (inspect_exitcode_docker) != 0 || res <= 0) {
+    fprintf (ERRORFILE,
+     "Could not inspect docker to get exitcode:  %s.\n", docker_inspect_exitcode_command);
+      fflush(ERRORFILE);
+      exit_code = -1;
+      goto cleanup;
+    }
+    fprintf(LOGFILE, "Exit code from docker inspect: %d\n", exit_code);
     if(exit_code != 0) {
       fprintf(ERRORFILE, "Docker container exit code was not zero: %d\n",
       exit_code);
@@ -1480,19 +1621,6 @@ int launch_docker_container_as_user(const char * user, const char *app_id,
     }
   }
 
-  fprintf(LOGFILE, "Removing docker container post-exit...\n");
-  snprintf(docker_rm_command, command_size,
-    "%s rm %s", docker_binary, container_id);
-  FILE* rm_docker = popen(docker_rm_command, "w");
-  if (pclose (rm_docker) != 0)
-  {
-    fprintf (ERRORFILE,
-     "Could not remove container %s.\n", docker_rm_command);
-    fflush(ERRORFILE);
-    exit_code = UNABLE_TO_EXECUTE_CONTAINER_SCRIPT;
-    goto cleanup;
-  }
-
 cleanup:
 
   if (exit_code_file != NULL && write_exit_code_file_as_nm(exit_code_file, exit_code) < 0) {
@@ -1500,6 +1628,7 @@ cleanup:
       "Could not write exit code to file %s.\n", exit_code_file);
     fflush(ERRORFILE);
   }
+  fprintf(LOGFILE, "Wrote the exit code %d to %s\n", exit_code, exit_code_file);
 
   // Drop root privileges
   if (change_effective_user(prev_uid, user_gid) != 0) {
@@ -1731,18 +1860,19 @@ static int unlink_helper(int dirfd, const char *name, int flags) {
 }
 
 /**
- * Determine if an entry in a directory is a symlink.
+ * Determine if an entry in a directory is another directory without following
+ * symlinks.
  *
  * @param dirfd     The directory file descriptor, or -1 if there is none.
  * @param name      If dirfd is -1, this is the path to examine.
  *                  Otherwise, this is the file name in the directory to
  *                  examine.
  *
- * @return          0 if the entry is not a symlink
- *                  1 if the entry is a symlink
+ * @return          0 if the entry is a symlink or otherwise not a directory
+ *                  1 if the entry is a directory
  *                  A negative errno code if we couldn't access the entry.
  */
-static int is_symlink_helper(int dirfd, const char *name)
+static int is_dir_helper(int dirfd, const char *name)
 {
   struct stat stat;
 
@@ -1755,7 +1885,7 @@ static int is_symlink_helper(int dirfd, const char *name)
       return -errno;
     }
   }
-  return !!S_ISLNK(stat.st_mode);
+  return !!S_ISDIR(stat.st_mode);
 }
 
 static int recursive_unlink_helper(int dirfd, const char *name,
@@ -1765,30 +1895,29 @@ static int recursive_unlink_helper(int dirfd, const char *name,
   DIR *dfd = NULL;
   struct stat stat;
 
-  // Check to see if the file is a symlink.  If so, delete the symlink rather
-  // than what it points to.
-  ret = is_symlink_helper(dirfd, name);
+  // Check to see if the file is a directory. If not then we can unlink it now.
+  ret = is_dir_helper(dirfd, name);
   if (ret < 0) {
-    // is_symlink_helper failed.
+    // is_dir_helper failed.
     if (ret == -ENOENT) {
       ret = 0;
       goto done;
     }
     ret = -ret;
-    fprintf(LOGFILE, "is_symlink_helper(%s) failed: %s\n",
+    fprintf(LOGFILE, "is_dir_helper(%s) failed: %s\n",
             fullpath, strerror(ret));
     goto done;
-  } else if (ret == 1) {
-    // is_symlink_helper determined that the path is a symlink.
+  } else if (ret == 0) {
+    // is_dir_helper determined that the path is not a directory.
     ret = unlink_helper(dirfd, name, 0);
     if (ret) {
-      fprintf(LOGFILE, "failed to unlink symlink %s: %s\n",
+      fprintf(LOGFILE, "failed to unlink %s: %s\n",
               fullpath, strerror(ret));
     }
     goto done;
   }
 
-  // Open the file.  We use O_NOFOLLOW here to ensure that we if a symlink was
+  // Open the directory. We use O_NOFOLLOW here to ensure that if a symlink was
   // swapped in by an attacker, we will fail to follow it rather than deleting
   // something we potentially should not.
   fd = open_helper(dirfd, name);
@@ -1829,6 +1958,19 @@ static int recursive_unlink_helper(int dirfd, const char *name,
       goto done;
     }
   } else {
+    // make sure the directory has full user permissions
+    // so entries can be deleted
+    if ((stat.st_mode & S_IRWXU) != S_IRWXU) {
+      ret = chmod_helper(dirfd, name, 0700);
+      if (ret) {
+        if (ret == ENOENT) {
+          ret = 0;
+          goto done;
+        }
+        fprintf(LOGFILE, "chmod(%s) failed: %s\n", fullpath, strerror(ret));
+        goto done;
+      }
+    }
     dfd = fdopendir(fd);
     if (!dfd) {
       ret = errno;

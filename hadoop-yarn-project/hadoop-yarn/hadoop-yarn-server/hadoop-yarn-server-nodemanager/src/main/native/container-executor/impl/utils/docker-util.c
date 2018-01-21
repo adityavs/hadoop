@@ -17,6 +17,7 @@
  */
 
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <ctype.h>
@@ -159,6 +160,11 @@ static int add_docker_config_param(const struct configuration *command_config, c
   return add_param_to_command(command_config, "docker-config", "--config=", 1, out, outlen);
 }
 
+static int validate_volume_name(const char *volume_name) {
+  const char *regex_str = "^[a-zA-Z0-9]([a-zA-Z0-9_.-]*)$";
+  return execute_regex_match(regex_str, volume_name);
+}
+
 static int validate_container_name(const char *container_name) {
   const char *CONTAINER_NAME_PREFIX = "container_";
   if (0 == strncmp(container_name, CONTAINER_NAME_PREFIX, strlen(CONTAINER_NAME_PREFIX))) {
@@ -206,6 +212,12 @@ const char *get_docker_error_message(const int error_code) {
       return "Mount access error";
     case INVALID_DOCKER_DEVICE:
       return "Invalid docker device";
+    case INVALID_DOCKER_VOLUME_DRIVER:
+      return "Invalid docker volume-driver";
+    case INVALID_DOCKER_VOLUME_NAME:
+      return "Invalid docker volume name";
+    case INVALID_DOCKER_VOLUME_COMMAND:
+      return "Invalid docker volume command";
     default:
       return "Unknown error";
   }
@@ -242,6 +254,8 @@ int get_docker_command(const char *command_file, const struct configuration *con
   char *command = get_configuration_value("docker-command", DOCKER_COMMAND_FILE_SECTION, &command_config);
   if (strcmp(DOCKER_INSPECT_COMMAND, command) == 0) {
     return get_docker_inspect_command(command_file, conf, out, outlen);
+  } else if (strcmp(DOCKER_KILL_COMMAND, command) == 0) {
+    return get_docker_kill_command(command_file, conf, out, outlen);
   } else if (strcmp(DOCKER_LOAD_COMMAND, command) == 0) {
     return get_docker_load_command(command_file, conf, out, outlen);
   } else if (strcmp(DOCKER_PULL_COMMAND, command) == 0) {
@@ -252,9 +266,147 @@ int get_docker_command(const char *command_file, const struct configuration *con
     return get_docker_run_command(command_file, conf, out, outlen);
   } else if (strcmp(DOCKER_STOP_COMMAND, command) == 0) {
     return get_docker_stop_command(command_file, conf, out, outlen);
+  } else if (strcmp(DOCKER_VOLUME_COMMAND, command) == 0) {
+    return get_docker_volume_command(command_file, conf, out, outlen);
   } else {
     return UNKNOWN_DOCKER_COMMAND;
   }
+}
+
+// check if a key is permitted in the configuration
+// return 1 if permitted
+static int value_permitted(const struct configuration* executor_cfg,
+                           const char* key, const char* value) {
+  char **permitted_values = get_configuration_values_delimiter(key,
+    CONTAINER_EXECUTOR_CFG_DOCKER_SECTION, executor_cfg, ",");
+  if (!permitted_values) {
+    return 0;
+  }
+
+  char** permitted = permitted_values;
+  int found = 0;
+
+  while (*permitted) {
+    if (0 == strncmp(*permitted, value, 1024)) {
+      found = 1;
+      break;
+    }
+    permitted++;
+  }
+
+  free_values(permitted_values);
+
+  return found;
+}
+
+int get_docker_volume_command(const char *command_file, const struct configuration *conf, char *out,
+                               const size_t outlen) {
+  int ret = 0;
+  char *driver = NULL, *volume_name = NULL, *sub_command = NULL, *format = NULL;
+  struct configuration command_config = {0, NULL};
+  ret = read_and_verify_command_file(command_file, DOCKER_VOLUME_COMMAND, &command_config);
+  if (ret != 0) {
+    return ret;
+  }
+  sub_command = get_configuration_value("sub-command", DOCKER_COMMAND_FILE_SECTION, &command_config);
+
+  if ((sub_command == NULL) || ((0 != strcmp(sub_command, "create")) &&
+      (0 != strcmp(sub_command, "ls")))) {
+    fprintf(ERRORFILE, "\"create/ls\" are the only acceptable sub-command of volume, input sub_command=\"%s\"\n",
+       sub_command);
+    ret = INVALID_DOCKER_VOLUME_COMMAND;
+    goto cleanup;
+  }
+
+  memset(out, 0, outlen);
+
+  ret = add_docker_config_param(&command_config, out, outlen);
+  if (ret != 0) {
+    ret = BUFFER_TOO_SMALL;
+    goto cleanup;
+  }
+
+  ret = add_to_buffer(out, outlen, DOCKER_VOLUME_COMMAND);
+  if (ret != 0) {
+    goto cleanup;
+  }
+
+  if (0 == strcmp(sub_command, "create")) {
+    volume_name = get_configuration_value("volume", DOCKER_COMMAND_FILE_SECTION, &command_config);
+    if (volume_name == NULL || validate_volume_name(volume_name) != 0) {
+      fprintf(ERRORFILE, "%s is not a valid volume name.\n", volume_name);
+      ret = INVALID_DOCKER_VOLUME_NAME;
+      goto cleanup;
+    }
+
+    driver = get_configuration_value("driver", DOCKER_COMMAND_FILE_SECTION, &command_config);
+    if (driver == NULL) {
+      ret = INVALID_DOCKER_VOLUME_DRIVER;
+      goto cleanup;
+    }
+
+    ret = add_to_buffer(out, outlen, " create");
+    if (ret != 0) {
+      goto cleanup;
+    }
+
+    ret = add_to_buffer(out, outlen, " --name=");
+    if (ret != 0) {
+      goto cleanup;
+    }
+
+    ret = add_to_buffer(out, outlen, volume_name);
+    if (ret != 0) {
+      goto cleanup;
+    }
+
+    if (!value_permitted(conf, "docker.allowed.volume-drivers", driver)) {
+      fprintf(ERRORFILE, "%s is not permitted docker.allowed.volume-drivers\n",
+        driver);
+      ret = INVALID_DOCKER_VOLUME_DRIVER;
+      goto cleanup;
+    }
+
+    ret = add_to_buffer(out, outlen, " --driver=");
+    if (ret != 0) {
+      goto cleanup;
+    }
+
+    ret = add_to_buffer(out, outlen, driver);
+    if (ret != 0) {
+      goto cleanup;
+    }
+  } else if (0 == strcmp(sub_command, "ls")) {
+    format = get_configuration_value("format", DOCKER_COMMAND_FILE_SECTION, &command_config);
+
+    ret = add_to_buffer(out, outlen, " ls");
+    if (ret != 0) {
+      goto cleanup;
+    }
+
+    if (format) {
+      ret = add_to_buffer(out, outlen, " --format=");
+      if (ret != 0) {
+        goto cleanup;
+      }
+      ret = add_to_buffer(out, outlen, format);
+      if (ret != 0) {
+        goto cleanup;
+      }
+    }
+  }
+
+cleanup:
+  free(driver);
+  free(volume_name);
+  free(sub_command);
+  free(format);
+
+  // clean up out buffer
+  if (ret != 0) {
+    out[0] = 0;
+  }
+  return ret;
 }
 
 int get_docker_inspect_command(const char *command_file, const struct configuration *conf, char *out,
@@ -512,6 +664,66 @@ int get_docker_stop_command(const char *command_file, const struct configuration
   return BUFFER_TOO_SMALL;
 }
 
+int get_docker_kill_command(const char *command_file, const struct configuration *conf,
+                            char *out, const size_t outlen) {
+  int ret = 0;
+  size_t len = 0, i = 0;
+  char *value = NULL;
+  char *container_name = NULL;
+  struct configuration command_config = {0, NULL};
+  ret = read_and_verify_command_file(command_file, DOCKER_KILL_COMMAND, &command_config);
+  if (ret != 0) {
+    return ret;
+  }
+
+  container_name = get_configuration_value("name", DOCKER_COMMAND_FILE_SECTION, &command_config);
+  if (container_name == NULL || validate_container_name(container_name) != 0) {
+    return INVALID_DOCKER_CONTAINER_NAME;
+  }
+
+  memset(out, 0, outlen);
+
+  ret = add_docker_config_param(&command_config, out, outlen);
+  if (ret != 0) {
+    return BUFFER_TOO_SMALL;
+  }
+
+  ret = add_to_buffer(out, outlen, DOCKER_KILL_COMMAND);
+  if (ret == 0) {
+    value = get_configuration_value("signal", DOCKER_COMMAND_FILE_SECTION, &command_config);
+    if (value != NULL) {
+      len = strlen(value);
+      for (i = 0; i < len; ++i) {
+        if (isupper(value[i]) == 0) {
+          fprintf(ERRORFILE, "Value for signal contains non-uppercase characters '%s'\n", value);
+          free(container_name);
+          memset(out, 0, outlen);
+          return INVALID_DOCKER_KILL_COMMAND;
+        }
+      }
+      ret = add_to_buffer(out, outlen, " --signal=");
+      if (ret == 0) {
+        ret = add_to_buffer(out, outlen, value);
+      }
+      if (ret != 0) {
+        free(container_name);
+        return BUFFER_TOO_SMALL;
+      }
+    }
+    ret = add_to_buffer(out, outlen, " ");
+    if (ret == 0) {
+      ret = add_to_buffer(out, outlen, container_name);
+    }
+    free(container_name);
+    if (ret != 0) {
+      return BUFFER_TOO_SMALL;
+    }
+    return 0;
+  }
+  free(container_name);
+  return BUFFER_TOO_SMALL;
+}
+
 static int detach_container(const struct configuration *command_config, char *out, const size_t outlen) {
   return add_param_to_command(command_config, "detach", "-d ", 0, out, outlen);
 }
@@ -623,6 +835,11 @@ static char* normalize_mount(const char* mount) {
   }
   real_mount = realpath(mount, NULL);
   if (real_mount == NULL) {
+    // If mount is a valid named volume, just return it and let docker decide
+    if (validate_volume_name(mount) == 0) {
+      return strdup(mount);
+    }
+
     fprintf(ERRORFILE, "Could not determine real path of mount '%s'\n", mount);
     free(real_mount);
     return NULL;
@@ -687,8 +904,9 @@ static int check_mount_permitted(const char **permitted_mounts, const char *requ
     }
     // directory check
     permitted_mount_len = strlen(permitted_mounts[i]);
-    if (permitted_mount_len > 0
-        && permitted_mounts[i][permitted_mount_len - 1] == '/') {
+    struct stat path_stat;
+    stat(permitted_mounts[i], &path_stat);
+    if(S_ISDIR(path_stat.st_mode)) {
       if (strncmp(normalized_path, permitted_mounts[i], permitted_mount_len) == 0) {
         ret = 1;
         break;
@@ -828,9 +1046,10 @@ static int set_privileged(const struct configuration *command_config, const stru
       = get_configuration_value("docker.privileged-containers.enabled", CONTAINER_EXECUTOR_CFG_DOCKER_SECTION, conf);
   int ret = 0;
 
-  if (value != NULL && strcmp(value, "true") == 0) {
+  if (value != NULL && strcasecmp(value, "true") == 0 ) {
     if (privileged_container_enabled != NULL) {
-      if (strcmp(privileged_container_enabled, "1") == 0) {
+      if (strcmp(privileged_container_enabled, "1") == 0 ||
+          strcasecmp(privileged_container_enabled, "True") == 0) {
         ret = add_to_buffer(out, outlen, "--privileged ");
         if (ret != 0) {
           ret = BUFFER_TOO_SMALL;

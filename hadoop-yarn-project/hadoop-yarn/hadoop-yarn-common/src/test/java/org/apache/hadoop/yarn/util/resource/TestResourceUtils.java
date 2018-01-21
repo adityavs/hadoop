@@ -24,6 +24,7 @@ import org.apache.hadoop.yarn.api.protocolrecords.ResourceTypes;
 import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.api.records.ResourceInformation;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
+import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -48,6 +49,23 @@ public class TestResourceUtils {
       resourceCount = count;
       resourceNameUnitsMap = new HashMap<>();
     }
+  }
+
+  public static void addNewTypesToResources(String... resourceTypes) {
+    // Initialize resource map
+    Map<String, ResourceInformation> riMap = new HashMap<>();
+
+    // Initialize mandatory resources
+    riMap.put(ResourceInformation.MEMORY_URI, ResourceInformation.MEMORY_MB);
+    riMap.put(ResourceInformation.VCORES_URI, ResourceInformation.VCORES);
+
+    for (String newResource : resourceTypes) {
+      riMap.put(newResource, ResourceInformation
+          .newInstance(newResource, "", 0, ResourceTypes.COUNTABLE, 0,
+              Integer.MAX_VALUE));
+    }
+
+    ResourceUtils.initializeResourcesFromResourceInformationMap(riMap);
   }
 
   @Before
@@ -105,9 +123,10 @@ public class TestResourceUtils {
         new ResourceFileInformation("resource-types-3.xml", 3);
     testFile3.resourceNameUnitsMap.put("resource2", "");
     ResourceFileInformation testFile4 =
-        new ResourceFileInformation("resource-types-4.xml", 4);
+        new ResourceFileInformation("resource-types-4.xml", 5);
     testFile4.resourceNameUnitsMap.put("resource1", "G");
     testFile4.resourceNameUnitsMap.put("resource2", "m");
+    testFile4.resourceNameUnitsMap.put("yarn.io/gpu", "");
 
     ResourceFileInformation[] tests = {testFile1, testFile2, testFile3,
         testFile4};
@@ -273,6 +292,8 @@ public class TestResourceUtils {
         ResourceInformation.newInstance("resource1", "Gi", 5L));
     test3Resources.setResourceInformation("resource2",
         ResourceInformation.newInstance("resource2", "m", 2L));
+    test3Resources.setResourceInformation("yarn.io/gpu",
+        ResourceInformation.newInstance("yarn.io/gpu", "", 1));
     testRun.put("node-resources-2.xml", test3Resources);
 
     for (Map.Entry<String, Resource> entry : testRun.entrySet()) {
@@ -291,6 +312,42 @@ public class TestResourceUtils {
         Assert.assertEquals(resInfo, actual.get(resInfo.getName()));
       }
       dest.delete();
+    }
+  }
+
+  @Test
+  public void testResourceNameFormatValidation() throws Exception {
+    String[] validNames = new String[] {
+        "yarn.io/gpu",
+        "gpu",
+        "g_1_2",
+        "123.io/gpu",
+        "prefix/resource_1",
+        "a___-3",
+        "a....b",
+    };
+
+    String[] invalidNames = new String[] {
+        "asd/resource/-name",
+        "prefix/-resource_1",
+        "prefix/0123resource",
+        "0123resource",
+        "-resource_1",
+        "........abc"
+    };
+
+    for (String validName : validNames) {
+      ResourceUtils.validateNameOfResourceNameAndThrowException(validName);
+    }
+
+    for (String invalidName : invalidNames) {
+      try {
+        ResourceUtils.validateNameOfResourceNameAndThrowException(invalidName);
+        Assert.fail("Expected to fail name check, the name=" + invalidName
+            + " is illegal.");
+      } catch (YarnRuntimeException e) {
+        // Expected
+      }
     }
   }
 

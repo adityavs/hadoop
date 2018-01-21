@@ -66,6 +66,12 @@ public class DockerRunCommand extends DockerCommand {
     return this;
   }
 
+  public DockerRunCommand addReadWriteMountLocation(String sourcePath, String
+      destinationPath) {
+    super.addCommandArguments("rw-mounts", sourcePath + ":" + destinationPath);
+    return this;
+  }
+
   public DockerRunCommand addReadOnlyMountLocation(String sourcePath, String
       destinationPath, boolean createSource) {
     boolean sourceExists = new File(sourcePath).exists();
@@ -73,6 +79,17 @@ public class DockerRunCommand extends DockerCommand {
       return this;
     }
     super.addCommandArguments("ro-mounts", sourcePath + ":" + destinationPath);
+    return this;
+  }
+
+  public DockerRunCommand addReadOnlyMountLocation(String sourcePath, String
+      destinationPath) {
+    super.addCommandArguments("ro-mounts", sourcePath + ":" + destinationPath);
+    return this;
+  }
+
+  public DockerRunCommand setVolumeDriver(String volumeDriver) {
+    super.addCommandArguments("volume-driver", volumeDriver);
     return this;
   }
 
